@@ -1,0 +1,34 @@
+# Copy this into the CLIENT's repo at .github/workflows/zenik.yml
+#
+# Note what is NOT here: no Zenik GitHub App, no Zenik OAuth, no Zenik bot
+# account. The action runs on the client's runner with the client's own token
+# and the client's own agent key.
+name: Zenik change impact
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read        # read the diff
+  pull-requests: write  # post the impact comment
+  checks: write         # optional: also publish a check run
+
+jobs:
+  impact:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The blast radius is computed from the PR diff against its base, so
+          # the history has to be deep enough to find the merge base. A shallow
+          # clone (the default depth of 1) has no base to diff against.
+          fetch-depth: 0
+
+      - uses: zenikhq/zenik-action@v1
+        with:
+          zenik-platform-url: ${{ vars.ZENIK_PLATFORM_URL }}
+          zenik-client-key: ${{ secrets.ZENIK_CLIENT_KEY }}
+          # The client's own agent key. Also enables the semantic half of the
+          # blast radius, since embeddings are computed on this runner.
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}

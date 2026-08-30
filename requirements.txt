@@ -1,0 +1,9 @@
+# The agent CLIs (Codex / Claude Code) are installed at run time via npm by
+# agent_backends.py — they are Node packages and which one is installed depends
+# on which key the caller configured.
+#
+# Everything else here runs on the CLIENT's runner, so the dependency surface
+# is kept deliberately small (the prototype's rule, carried forward).
+python-dotenv>=1.0.0
+tree-sitter>=0.23
+tree-sitter-language-pack>=0.7
