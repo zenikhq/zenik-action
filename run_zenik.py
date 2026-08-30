@@ -59,7 +59,8 @@ from zenik_indexer.embeddings import get_embedder  # noqa: E402
 # checked the client's code into. For a manual/local run, set CLIENT_REPO_PATH.
 CLIENT_REPO = Path(os.environ.get("CLIENT_REPO_PATH", ".")).resolve()
 
-_PLATFORM_TIMEOUT = 30  # index/impact can carry a sizable body; be generous.
+_PLATFORM_TIMEOUT = 120     # impact/telemetry: loads the stored index server-side
+_INDEX_UPLOAD_TIMEOUT = 600  # /v1/index ships the whole embedded index (tens of MB)
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +179,8 @@ def changed_payload(changed) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Platform round-trip
 # ---------------------------------------------------------------------------
-def _platform_post(api_url: str, path: str, body: dict, client_key: str) -> Optional[dict]:
+def _platform_post(api_url: str, path: str, body: dict, client_key: str,
+                   timeout: int = _PLATFORM_TIMEOUT) -> Optional[dict]:
     """POST JSON to the platform with the client bearer key. Returns the parsed
     response, or None on any failure (logged, never raised)."""
     if not api_url:
@@ -195,7 +197,7 @@ def _platform_post(api_url: str, path: str, body: dict, client_key: str) -> Opti
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=_PLATFORM_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode()
             return json.loads(raw) if raw else {}
     except urllib.error.HTTPError as e:
@@ -218,7 +220,7 @@ def post_index(api_url, client_key, full_name, commit_sha, result) -> Optional[d
         "full_name": full_name,
         "commit_sha": commit_sha,
         "index": index_payload(result),
-    }, client_key)
+    }, client_key, timeout=_INDEX_UPLOAD_TIMEOUT)
 
 
 def post_impact(api_url, client_key, full_name, pr_number, changed) -> Optional[dict]:
