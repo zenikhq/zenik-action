@@ -1,7 +1,0 @@
-.env
-.venv/
-__pycache__/
-*.pyc
-.zenik-cache/
-zenik_findings.md
-.DS_Store
