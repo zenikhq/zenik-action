@@ -1,0 +1,193 @@
+# zenik-action — Zenik's client-side composite GitHub Action.
+#
+# A client references this from their own workflow as:
+#     uses: zenikhq/zenik-action@v1
+# on `on: pull_request`. GitHub fetches this repo at run time and runs the steps
+# below, with the CLIENT's repo already checked out as the working directory.
+#
+# What runs here, runs on the CLIENT's runner, with the CLIENT's keys:
+#   1. build the derived index of the checkout (VENDORED zenik-indexer),
+#   2. POST it to the Zenik platform /v1/index (no raw source — symbols/edges/
+#      embeddings only),
+#   3. compute the PR's changed symbols and POST them to /v1/impact,
+#   4. run the client's own coding agent to write PROSE findings (level 2 — no
+#      code changes), and
+#   5. post those findings back on the PR as a comment + commit status using the
+#      client's own GITHUB_TOKEN (authored as their github-actions[bot]).
+# Nothing in this action sends source code anywhere.
+name: "Zenik — change impact"
+description: "Computes a PR's blast radius with Zenik's index and posts prose findings + per-caller guidance to the PR."
+
+inputs:
+  openai-api-key:
+    description: >
+      The caller's OpenAI API key. Used for BOTH chunk embeddings during
+      indexing AND (unless anthropic is chosen) the Codex agent backend. Passed
+      as a step input, never a job-level env var, so it is not readable by other
+      steps or repository-controlled code in the same job. If absent, indexing
+      falls back to the offline embedder (semantic blast-radius disabled).
+    required: false
+    default: ""
+
+  anthropic-api-key:
+    description: >
+      The caller's Anthropic API key. Selects the Claude Code agent backend.
+      If both keys are provided, use `agent-backend` to choose.
+    required: false
+    default: ""
+
+  agent-backend:
+    description: "Which agent to use: 'codex' or 'claude-code'. Defaults to whichever key is set (codex if both)."
+    required: false
+    default: ""
+
+  agent-model:
+    description: "Optional model override passed through to the agent CLI."
+    required: false
+    default: ""
+
+  agent-timeout-seconds:
+    description: "Wall-clock limit for the agent run."
+    required: false
+    default: "900"
+
+  zenik-api-url:
+    description: "Base URL of the Zenik platform (serves /v1/index, /v1/impact, /v1/telemetry)."
+    required: false
+    default: ""
+
+  zenik-client-key:
+    description: "The caller's Zenik client key (machine credential; Bearer auth to the platform)."
+    required: false
+    default: ""
+
+  github-token:
+    description: >
+      Token used to post the PR comment + commit status. Defaults to the
+      workflow's own GITHUB_TOKEN, so the comment is authored by the caller's
+      github-actions[bot] in their own repo. Needs `pull-requests: write` and
+      `statuses: write` in the caller's workflow permissions.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  impacted-count:
+    description: "Number of potentially affected sites Zenik surfaced. 0 means no impact was found."
+    value: ${{ steps.zenik.outputs.impacted-count }}
+  outcome:
+    description: "One of: reported, no_impact, agent_failed."
+    value: ${{ steps.zenik.outputs.outcome }}
+
+runs:
+  using: "composite"
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    # Agent CLIs are distributed via npm; Python drives them.
+    - uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+
+    - name: Install dependencies
+      shell: bash
+      run: pip install -r ${{ github.action_path }}/requirements.txt
+
+    # Warm the tree-sitter grammar cache from the VENDORED indexer BEFORE the
+    # run, so indexing never has to hit the network mid-job (and a network
+    # hiccup can't stall a client's CI). Best-effort: grammars ship with the
+    # language pack, so this is a cache warm, not a hard dependency.
+    - name: Prefetch tree-sitter grammars
+      shell: bash
+      run: |
+        PYTHONPATH="${{ github.action_path }}/vendor" \
+          python -m zenik_indexer.cli prefetch || \
+          echo "[zenik] grammar prefetch skipped (will lazy-load during indexing)"
+
+    # Codex's Linux sandbox uses bubblewrap, which needs to create an
+    # unprivileged user namespace. On Ubuntu 24.04 — which is what
+    # ubuntu-latest runners are — AppArmor blocks that unless the
+    # bwrap-userns-restrict profile is loaded, and bwrap then fails every
+    # command with "Failed RTM_NEWADDR: Operation not permitted".
+    #
+    # This is the fix OpenAI documents for Ubuntu 24.04 rather than a
+    # workaround: install bubblewrap and load the AppArmor profile that
+    # permits its user namespaces. Doing it here keeps the agent properly
+    # sandboxed instead of resorting to --sandbox danger-full-access.
+    #
+    # Every command is tolerant of failure: on a runner where this isn't
+    # needed (a non-Ubuntu image, or a container without sudo) the setup is
+    # skipped and the agent still runs. If the sandbox genuinely can't start,
+    # run_zenik.py fails the run explicitly rather than proceeding unsandboxed.
+    # Only relevant to the Codex backend. This mirrors the backend selection
+    # in agent_backends.select_backend(): Codex runs when it is explicitly
+    # requested, or when OPENAI_API_KEY is the only key set, or when both keys
+    # are set and no preference is given. A caller on Claude Code should not
+    # pay for apt-get installing bubblewrap they will never use.
+    - name: Prepare Linux sandbox for the agent
+      if: >-
+        inputs.agent-backend == 'codex' ||
+        (inputs.agent-backend == '' && inputs.openai-api-key != '')
+      shell: bash
+      env:
+        AGENT_BACKEND: ${{ inputs.agent-backend }}
+      run: |
+        if [ "$RUNNER_OS" != "Linux" ]; then
+          echo "[sandbox-setup] not Linux; nothing to do"
+          exit 0
+        fi
+        if ! command -v sudo >/dev/null 2>&1; then
+          echo "[sandbox-setup] no sudo available; skipping"
+          exit 0
+        fi
+
+        echo "[sandbox-setup] installing bubblewrap + apparmor profiles"
+        sudo apt-get update -qq || true
+        sudo apt-get install -y -qq bubblewrap apparmor-profiles apparmor-utils || true
+
+        PROFILE=/usr/share/apparmor/extra-profiles/bwrap-userns-restrict
+        if [ -f "$PROFILE" ]; then
+          echo "[sandbox-setup] loading bwrap-userns-restrict AppArmor profile"
+          sudo install -m 0644 "$PROFILE" /etc/apparmor.d/bwrap-userns-restrict || true
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict || true
+        else
+          echo "[sandbox-setup] profile not present at $PROFILE"
+        fi
+
+        # Verify: this is the exact operation that fails when AppArmor blocks
+        # bwrap. Its result tells us whether the sandbox will work before we
+        # spend an agent run finding out.
+        if command -v bwrap >/dev/null 2>&1; then
+          if bwrap --unshare-all --dev-bind / / /bin/true 2>/dev/null; then
+            echo "[sandbox-setup] OK — bubblewrap can create a user namespace"
+          else
+            echo "[sandbox-setup] WARNING: bubblewrap still cannot create a user"
+            echo "[sandbox-setup] namespace. Trying the documented sysctl fallback."
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+            if bwrap --unshare-all --dev-bind / / /bin/true 2>/dev/null; then
+              echo "[sandbox-setup] OK after sysctl adjustment"
+            else
+              echo "[sandbox-setup] bubblewrap sandbox is unavailable on this runner."
+              echo "[sandbox-setup] The agent step will fail rather than run unsandboxed."
+            fi
+          fi
+        else
+          echo "[sandbox-setup] bwrap not installed; the agent step will report it"
+        fi
+
+    - name: Zenik change-impact
+      id: zenik
+      shell: bash
+      env:
+        # Keys are scoped to THIS step only — never job-level env, where
+        # repo-controlled code in the same job could read them.
+        OPENAI_API_KEY: ${{ inputs.openai-api-key }}
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        AGENT_BACKEND: ${{ inputs.agent-backend }}
+        AGENT_MODEL: ${{ inputs.agent-model }}
+        AGENT_TIMEOUT_SECONDS: ${{ inputs.agent-timeout-seconds }}
+        ZENIK_API_URL: ${{ inputs.zenik-api-url }}
+        ZENIK_CLIENT_KEY: ${{ inputs.zenik-client-key }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: python ${{ github.action_path }}/run_zenik.py

@@ -1,0 +1,11 @@
+.env
+.env.zenik
+.venv/
+__pycache__/
+*.pyc
+
+# Local artifact written by run_zenik.py on a dry/local run (no PR to post to).
+zenik_change_impact.md
+
+# vendor/ is intentionally NOT ignored — the vendored indexer is committed so it
+# ships with the action to the client's runner. See sync_vendor.sh.

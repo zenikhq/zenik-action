@@ -1,0 +1,26 @@
+# Runtime dependencies for zenik-action, installed on the CLIENT's runner.
+#
+# The agent CLIs (Codex / Claude Code) are NOT here — they are npm packages
+# installed at run time by agent_backends.py, and which one gets installed
+# depends on which key the caller configured.
+#
+# These are the VENDORED indexer's runtime deps (the indexer package itself is
+# vendored under vendor/, not pip-installed — see sync_vendor.sh). Kept in sync
+# with ../zenik-indexer/requirements.txt.
+
+# tree-sitter chunker + symbol/import extraction (Layer A + B).
+tree-sitter==0.25.2
+tree-sitter-language-pack==1.15.8
+
+# Chunk embeddings. Optional at run time: if OPENAI_API_KEY is unset the indexer
+# falls back to a deterministic offline embedder, so this action still runs with
+# the semantic half of blast radius disabled.
+openai>=1.40,<2
+
+# NOTE: psycopg is deliberately NOT listed. The action never talks to Postgres —
+# it POSTs the derived index to the platform over HTTP (stdlib urllib). Only the
+# platform's server-side store needs a DB driver.
+#
+# Telemetry and all platform/GitHub calls use urllib from the standard library
+# rather than `requests`, to keep this dependency list minimal on someone else's
+# runner.

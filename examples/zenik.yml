@@ -1,0 +1,53 @@
+# Example client workflow — drop this in your repo at .github/workflows/zenik.yml
+#
+# It runs Zenik's change-impact analysis on every pull request: Zenik computes
+# the blast radius of the change and posts prose findings + per-caller guidance
+# back on the PR as a comment + a "zenik/change-impact" status.
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   ZENIK_CLIENT_KEY   — your Zenik client key (machine credential for the platform)
+#   OPENAI_API_KEY     — used for chunk embeddings AND the Codex agent, OR
+#   ANTHROPIC_API_KEY  — used for the Claude Code agent
+# Provide at least one agent key. If you use Claude Code as the agent but still
+# want the semantic half of blast radius, also set OPENAI_API_KEY (embeddings).
+
+name: Zenik change impact
+
+on:
+  pull_request:
+
+# The action posts a PR comment and a commit status as your own
+# github-actions[bot], so the default token needs these scopes.
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+
+jobs:
+  zenik:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the PR
+        uses: actions/checkout@v4
+        with:
+          # Zenik diffs the PR against its base, so the base commit must be
+          # present locally. fetch-depth: 0 fetches full history (simplest);
+          # a shallow fetch of just the base ref also works.
+          fetch-depth: 0
+
+      - name: Run Zenik
+        uses: zenikhq/zenik-action@v1
+        with:
+          zenik-api-url: https://api.zenik.dev
+          zenik-client-key: ${{ secrets.ZENIK_CLIENT_KEY }}
+
+          # One or both agent keys. If both are set, Codex is used by default;
+          # pass agent-backend: claude-code to choose Claude Code instead.
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # agent-backend: claude-code
+          # agent-model: gpt-5-codex
+
+          # github-token defaults to the workflow's own token; only override to
+          # post as a different identity.
+          # github-token: ${{ secrets.GITHUB_TOKEN }}
