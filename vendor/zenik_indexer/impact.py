@@ -137,21 +137,37 @@ class ImpactEngine:
         return best
 
     # -- semantic NN --------------------------------------------------------
-    def _semantic(self, seeds: dict[str, str], top_k: int
+    def _semantic(self, seeds: dict[str, str], top_k: int,
+                  query_vectors: Optional[dict[str, list[float]]] = None,
                  ) -> dict[str, tuple[float, set[str]]]:
-        """Cosine-NN from each seed's chunk to all chunks. Returns key -> (sim, vias)."""
+        """Cosine-NN from each seed's chunk to all chunks. Returns key -> (sim, vias).
+
+        `query_vectors` (changed-symbol NAME -> embedding) lets the caller
+        supply a FRESH vector for the changed code — a PR query embeds only its
+        changed chunks and searches the stored graph with them. Falls back to
+        the stored chunk's (base-version) embedding when absent.
+        """
         if not self._chunks:
             return {}
+        stored_dim = len(self._chunks[0].embedding or [])
         out: dict[str, tuple[float, set[str]]] = {}
         for seed_key, via in seeds.items():
             qchunk = self._chunk_by_symbol.get(seed_key)
-            if qchunk is None:
+            qvec = (query_vectors or {}).get(via)
+            if qvec is not None and len(qvec) != stored_dim:
+                qvec = None  # different embedder than the stored graph — unusable
+            if qvec is None:
+                qvec = qchunk.embedding if qchunk is not None else None
+            if qvec is None:
                 continue
+            qsym = self.by_key.get(seed_key)
+            qpath = qsym.path if qsym is not None else (
+                qchunk.path if qchunk is not None else None)
             sims: list[tuple[float, Chunk]] = []
             for c in self._chunks:
-                if c.symbol == seed_key or c.path == qchunk.path:
+                if c.symbol == seed_key or c.path == qpath:
                     continue  # skip self and same-file chunks
-                sims.append((cosine(qchunk.embedding, c.embedding), c))
+                sims.append((cosine(qvec, c.embedding), c))
             sims.sort(key=lambda t: t[0], reverse=True)
             for sim, c in sims[:top_k]:
                 if sim <= 0 or not c.symbol:
@@ -173,12 +189,14 @@ class ImpactEngine:
         max_depth: int = _MAX_DEPTH,
         semantic: bool = True,
         top_semantic: int = _MAX_SEMANTIC,
+        query_vectors: Optional[dict[str, list[float]]] = None,
     ) -> ContextBundle:
         seeds = self._resolve_seeds(changed)
         changed_services = {_service_of(cs.path) for cs in changed}
 
         det = self._walk(seeds, max_depth)
-        sem = self._semantic(seeds, top_semantic) if semantic else {}
+        sem = (self._semantic(seeds, top_semantic, query_vectors)
+               if semantic else {})
 
         candidates = set(det) | set(sem)
         items: list[ImpactItem] = []

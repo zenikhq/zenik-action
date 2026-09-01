@@ -1,8 +1,13 @@
 # Example client workflow — drop this in your repo at .github/workflows/zenik.yml
 #
-# It runs Zenik's change-impact analysis on every pull request: Zenik computes
-# the blast radius of the change and posts prose findings + per-caller guidance
-# back on the PR as a comment + a "zenik/change-impact" status.
+# Two modes from one workflow:
+#   pull_request      — Zenik computes the change's blast radius against the
+#                       stored graph and posts inline findings + a summary on
+#                       the PR (read-only; nothing is uploaded).
+#   push to default   — Zenik refreshes the stored dependency graph: it embeds
+#                       and uploads ONLY chunks whose content changed. The very
+#                       first push run indexes everything — that's onboarding
+#                       (merging THIS file to your default branch triggers it).
 #
 # Required repository secrets (Settings → Secrets and variables → Actions):
 #   ZENIK_CLIENT_KEY   — your Zenik client key (machine credential for the platform)
@@ -15,6 +20,9 @@ name: Zenik change impact
 
 on:
   pull_request:
+  push:
+    branches: [main]        # keep in sync with your default branch
+  workflow_dispatch:         # manual "index now" button for onboarding
 
 # The action posts a PR comment and a commit status as your own
 # github-actions[bot], so the default token needs these scopes.

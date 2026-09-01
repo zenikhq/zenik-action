@@ -51,6 +51,7 @@ TELEMETRY_TIMEOUT_SECONDS = 5
 OUTCOME_REPORTED = "reported"          # findings computed and posted to the PR
 OUTCOME_NO_IMPACT = "no_impact"        # ran, blast radius was empty; nothing to report
 OUTCOME_AGENT_FAILED = "agent_failed"  # agent errored or timed out
+OUTCOME_INDEXED = "indexed"            # index-update run (push): graph refreshed
 
 
 def hash_repo(repo_full_name, client_key):

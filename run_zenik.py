@@ -281,17 +281,18 @@ def changed_payload(changed) -> list[dict]:
 # ---------------------------------------------------------------------------
 # Platform round-trip
 # ---------------------------------------------------------------------------
-def _platform_post(api_url: str, path: str, body: dict, client_key: str,
-                   timeout: int = _PLATFORM_TIMEOUT) -> Optional[dict]:
-    """POST JSON to the platform with the client bearer key. Returns the parsed
+def _platform_request(api_url: str, path: str, body: Optional[dict],
+                      client_key: str, method: str,
+                      timeout: int = _PLATFORM_TIMEOUT) -> Optional[dict]:
+    """Call the platform with the client bearer key. Returns the parsed
     response, or None on any failure (logged, never raised)."""
     if not api_url:
         print(f"[zenik] no zenik-api-url configured; skipping {path}")
         return None
     url = api_url.rstrip("/") + path
-    data = json.dumps(body).encode()
+    data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(
-        url, data=data, method="POST",
+        url, data=data, method=method,
         headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {client_key}",
@@ -316,6 +317,19 @@ def _platform_post(api_url: str, path: str, body: dict, client_key: str,
     return None
 
 
+def _platform_post(api_url: str, path: str, body: dict, client_key: str,
+                   timeout: int = _PLATFORM_TIMEOUT) -> Optional[dict]:
+    return _platform_request(api_url, path, body, client_key, "POST", timeout)
+
+
+def fetch_manifest(api_url, client_key, full_name) -> Optional[dict]:
+    """What the platform already holds for this repo (chunk content hashes)."""
+    from urllib.parse import quote
+    return _platform_request(
+        api_url, f"/v1/index/manifest?full_name={quote(full_name, safe='')}",
+        None, client_key, "GET")
+
+
 def post_index(api_url, client_key, full_name, commit_sha, result) -> Optional[dict]:
     print(f"[zenik] POST /v1/index  ({result.stats()})")
     return _platform_post(api_url, "/v1/index", {
@@ -325,13 +339,16 @@ def post_index(api_url, client_key, full_name, commit_sha, result) -> Optional[d
     }, client_key, timeout=_INDEX_UPLOAD_TIMEOUT)
 
 
-def post_impact(api_url, client_key, full_name, pr_number, changed) -> Optional[dict]:
-    print(f"[zenik] POST /v1/impact  ({len(changed)} changed symbol(s))")
+def post_impact(api_url, client_key, full_name, pr_number, changed,
+                query_vectors=None) -> Optional[dict]:
+    print(f"[zenik] POST /v1/impact  ({len(changed)} changed symbol(s), "
+          f"{len(query_vectors or {})} fresh query vector(s))")
     return _platform_post(api_url, "/v1/impact", {
         "full_name": full_name,
         "pr_number": pr_number,
         "changed": changed_payload(changed),
         "semantic": True,
+        "query_vectors": query_vectors,
     }, client_key)
 
 
@@ -519,6 +536,94 @@ def publish_findings(ctx: PRContext, body: str, summary: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Index-update mode (push to the default branch): keep the stored graph fresh.
+# ---------------------------------------------------------------------------
+def run_index_update(ctx: PRContext, api_url: str, client_key: str,
+                     started: float) -> None:
+    """The graph lives on the platform and mirrors the DEFAULT branch. This
+    runs on `push` (and workflow_dispatch): parse everything (cheap), ask the
+    platform which chunk hashes it already has, embed ONLY the new ones, and
+    upload — unchanged chunks ship without vectors and the platform reuses the
+    stored ones. The first-ever run has an empty manifest, so it embeds and
+    ships everything: that IS onboarding."""
+    commit_sha = ctx.head or git_head_sha(ctx.repo_path)
+    print("[zenik] index-update mode: refreshing the stored graph "
+          f"(commit {commit_sha[:9] if commit_sha else '?'})")
+    index = build_index(str(ctx.repo_path), embed=False,
+                        commit_sha=commit_sha, progress=True)
+
+    manifest = fetch_manifest(api_url, client_key, ctx.full_name) or {}
+    known = set(manifest.get("content_hashes") or [])
+    new_chunks = [c for c in index.chunks
+                  if c.content_hash not in known and (c.text or "").strip()]
+    print(f"[zenik] {len(index.chunks)} chunk(s) parsed; "
+          f"{len(known)} already stored; {len(new_chunks)} to embed")
+
+    if new_chunks:
+        embedder = get_embedder()  # reads OPENAI_API_KEY; falls back offline
+        if embedder.name == "hash-fallback" and known:
+            # Mixing offline hash vectors into an OpenAI-embedded graph would
+            # corrupt the NN math; ship the new chunks vector-less instead.
+            print("[zenik] WARNING: no OPENAI_API_KEY — new chunks upload "
+                  "without embeddings (semantic misses new code until a keyed run)")
+        else:
+            print(f"[zenik] embedding {len(new_chunks)} chunk(s) "
+                  f"with {embedder.name}")
+            vectors = embedder.embed([c.text or "" for c in new_chunks])
+            for c, v in zip(new_chunks, vectors):
+                c.embedding = v
+
+    resp = post_index(api_url, client_key, ctx.full_name, commit_sha, index)
+    if resp is not None:
+        print(f"[zenik] index updated: {resp.get('stats')}")
+
+    payload = telemetry.build_payload(
+        client_key=client_key, repo_full_name=ctx.full_name,
+        run_id=telemetry.env_run_id(), outcome=telemetry.OUTCOME_INDEXED,
+        pr_number=None, impacted_count=0, changed_count=len(new_chunks),
+        cross_service_count=0,
+        duration_seconds=round(time.time() - started, 1), agent_result=None,
+    )
+    telemetry.print_payload(payload)
+    telemetry.send(payload, api_url=api_url, client_key=client_key)
+
+    gh_output = os.environ.get("GITHUB_OUTPUT")
+    if gh_output:
+        with open(gh_output, "a") as f:
+            f.write("impacted-count=0\n")
+            f.write(f"outcome={telemetry.OUTCOME_INDEXED}\n")
+    print(f"[zenik] Done. outcome={telemetry.OUTCOME_INDEXED} "
+          f"new_chunks={len(new_chunks)}")
+
+
+def compute_query_vectors(index, changed) -> Optional[dict]:
+    """Fresh embeddings for the changed chunks, keyed by changed-symbol name.
+
+    The PR's new code isn't in the stored graph, so the semantic search needs
+    its vectors from here. A few chunks per PR — cents, not a full re-embed.
+    Returns None (engine falls back to stored base-version vectors) when no
+    OpenAI key is set: offline hash vectors don't live in the same space as
+    the stored graph."""
+    embedder = get_embedder()
+    if embedder.name == "hash-fallback":
+        return None
+    pairs = []
+    for ch in changed:
+        chunk = next(
+            (c for c in index.chunks
+             if c.path == ch.path and (c.text or "").strip()
+             and not (c.end_line < ch.start_line or c.start_line > ch.end_line)),
+            None,
+        )
+        if chunk is not None:
+            pairs.append((ch.name, chunk.text or ""))
+    if not pairs:
+        return None
+    vectors = embedder.embed([t for _, t in pairs])
+    return {name: v for (name, _), v in zip(pairs, vectors)}
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 def main() -> None:
@@ -527,36 +632,44 @@ def main() -> None:
     client_key = os.environ.get("ZENIK_CLIENT_KEY", "")
     api_url = os.environ.get("ZENIK_API_URL", "")
 
+    # Two modes, one action: a push to the default branch refreshes the stored
+    # graph (write path); a pull_request queries it (read path — no upload).
+    event = (os.environ.get("ZENIK_MODE") or
+             os.environ.get("GITHUB_EVENT_NAME") or "").strip()
+    if event in ("push", "workflow_dispatch", "index"):
+        run_index_update(ctx, api_url, client_key, started)
+        return
+
     print(f"[zenik] repo={ctx.full_name or '(unknown)'} "
           f"base={ctx.base} head={ctx.head} pr=#{ctx.pr_number}")
 
     commit_sha = ctx.head or git_head_sha(ctx.repo_path)
 
-    # 1-2. Build the derived index and POST it to the platform. Embeddings use
-    # OPENAI_API_KEY if present (Zenik's key for the demo); otherwise the indexer
-    # degrades to its offline embedder (semantic half off) rather than failing.
-    embedder = get_embedder()  # reads OPENAI_API_KEY; falls back offline
-    print(f"[zenik] building index with embedder: {embedder.name}")
-    index = build_index(
-        str(ctx.repo_path), embedder=embedder, embed=True,
-        commit_sha=commit_sha, progress=True,
-    )
-    post_index(api_url, client_key, ctx.full_name, commit_sha, index)
+    # 1. Parse the checkout (no embedding, no upload — PRs only READ the
+    # graph). The local index serves the query vectors and the offline
+    # fallback; the stored graph on the platform mirrors the default branch.
+    print("[zenik] query mode: parsing checkout (no index upload)")
+    index = build_index(str(ctx.repo_path), embed=False,
+                        commit_sha=commit_sha, progress=True)
 
-    # 3. Changed symbols from the PR diff.
+    # 2. Changed symbols from the PR diff.
     changed = changed_symbols(str(ctx.repo_path), base=ctx.base, head=ctx.head)
     print(f"[zenik] changed symbols: {len(changed)}")
 
-    # 4. Blast radius from the platform; local fallback if it is unreachable.
+    # 3. Blast radius from the platform; local fallback if it is unreachable.
     bundle = None
     if changed:
-        resp = post_impact(api_url, client_key, ctx.full_name, ctx.pr_number, changed)
+        qvecs = compute_query_vectors(index, changed)
+        resp = post_impact(api_url, client_key, ctx.full_name, ctx.pr_number,
+                           changed, query_vectors=qvecs)
         if resp is not None:
             bundle = resp
         else:
-            print("[zenik] platform impact unavailable; computing blast radius "
-                  "locally from the in-process index (fallback).")
-            bundle = compute_impact(index, changed).to_dict()
+            print("[zenik] platform impact unavailable (unreachable, or repo "
+                  "not yet indexed — merge/run the indexing workflow on the "
+                  "default branch). Falling back to a local, deterministic-only "
+                  "blast radius.")
+            bundle = compute_impact(index, changed, semantic=False).to_dict()
     else:
         print("[zenik] no changed symbols resolved; empty blast radius.")
         bundle = {"changed": [], "impacted": [], "tests": [], "truncated": False}

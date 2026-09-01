@@ -111,15 +111,44 @@ class SupabaseStore:
         self._conn.commit()
         return str(rid)
 
+    # -- incremental support -------------------------------------------------
+    def chunk_hashes(self, repo_id: str) -> list[str]:
+        """The content hashes of a repo's stored chunks. The client compares
+        these against its freshly parsed chunks and embeds ONLY the hashes we
+        don't already have — the heart of incremental indexing."""
+        with self.conn().cursor() as cur:
+            cur.execute(
+                "select distinct content_hash from chunks "
+                "where repo_id = %s and embedding is not null",
+                (repo_id,),
+            )
+            return [r[0] for r in cur.fetchall()]
+
     # -- write path ---------------------------------------------------------
     def replace_index(self, repo_id: str, result: IndexResult) -> dict:
-        """Replace a repo's entire index (v0 does full rebuilds — see BUILD.md
-        §9.3). Deletes prior symbols (edges/chunks cascade) then bulk-inserts,
+        """Replace a repo's index. Symbols/edges are rewritten wholesale (they
+        are small); chunks that arrive WITHOUT an embedding reuse the stored
+        embedding for the same content_hash, so an incremental push only ships
+        vectors for genuinely new/changed chunks. Runs in one transaction,
         threading Symbol.key() -> uuid so edges/chunks resolve correctly."""
         from psycopg.rows import tuple_row
         conn = self._conn
         try:
             with conn.cursor(row_factory=tuple_row) as cur:
+                # Before the delete: grab stored embeddings for the hashes the
+                # payload omitted, so unchanged chunks keep their vectors.
+                missing = list({c.content_hash for c in result.chunks
+                                if c.embedding is None and c.content_hash})
+                reuse: dict[str, str] = {}
+                if missing:
+                    cur.execute(
+                        "select distinct on (content_hash) content_hash, "
+                        "embedding::text from chunks "
+                        "where repo_id = %s and content_hash = any(%s) "
+                        "and embedding is not null",
+                        (repo_id, missing),
+                    )
+                    reuse = {h: emb for h, emb in cur.fetchall()}
                 # Full rebuild: clear existing rows for this repo. edges/chunks have
                 # ON DELETE CASCADE from symbols, but delete them explicitly too so
                 # chunks whose symbol_id is null (module-less) also go.
@@ -165,12 +194,19 @@ class SupabaseStore:
                     )
 
                 # chunks — embedding as a vector literal; symbol_id nullable.
+                # A chunk without an embedding falls back to the stored vector
+                # for its content_hash (incremental push).
                 chunk_rows = []
+                reused = 0
                 for c in result.chunks:
                     sym_id = key_to_id.get(c.symbol) if c.symbol else None
+                    emb = _vec_literal(c.embedding)
+                    if emb is None and c.content_hash in reuse:
+                        emb = reuse[c.content_hash]
+                        reused += 1
                     chunk_rows.append((repo_id, sym_id, c.path, c.start_line,
                                        c.end_line, c.language, c.content_hash,
-                                       _vec_literal(c.embedding)))
+                                       emb))
                 if chunk_rows:
                     self._insert_values(
                         cur,
@@ -191,7 +227,7 @@ class SupabaseStore:
             conn.rollback()
             raise
         return {"symbols": len(result.symbols), "edges": len(result.edges),
-                "chunks": len(result.chunks)}
+                "chunks": len(result.chunks), "embeddings_reused": reused}
 
     # -- read path: rehydrate the stored index ------------------------------
     def load_index(self, repo_id: str) -> IndexResult:
