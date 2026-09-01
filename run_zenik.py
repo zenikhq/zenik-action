@@ -149,61 +149,98 @@ def pr_diff_text(repo_path: Path, base: Optional[str], head: Optional[str]) -> s
 # ---------------------------------------------------------------------------
 # Inline anchoring — which diff lines an inline review comment may pin to.
 # ---------------------------------------------------------------------------
-def diff_added_lines(diff_text: str) -> dict[str, list[int]]:
-    """Per new-side file path, the ADDED line numbers in the unified diff.
+def diff_anchor_lines(diff_text: str) -> dict[str, dict[str, list[int]]]:
+    """Per file path, the diff's anchorable lines: {'added': [new-side line
+    numbers], 'deleted': [old-side line numbers]}.
 
-    GitHub review comments only attach to lines present in the PR diff; added
-    lines (side RIGHT) are the safe anchors. An invalid anchor 422s the whole
-    review, so we only ever pin to lines this parse proves are in the diff.
+    GitHub review comments only attach to lines present in the PR diff — added
+    lines pin with side RIGHT, deleted lines with side LEFT (needed for
+    deletion-only changes, which have no added lines at all). An invalid anchor
+    422s the whole review, so we only ever pin to lines this parse proves are
+    in the diff.
     """
-    added: dict[str, list[int]] = {}
+    anchors: dict[str, dict[str, list[int]]] = {}
     path = None
+    old_path = None
     new_line = 0
+    old_line = 0
     in_hunk = False
     for raw in (diff_text or "").splitlines():
-        if raw.startswith("+++ "):
+        if raw.startswith("diff --git"):
+            # New file section: without this reset, the next file's `--- a/...`
+            # header would be misread as a deleted line of the previous hunk.
+            in_hunk = False
+            path = None
+            old_path = None
+        elif not in_hunk and raw.startswith("--- "):
             target = raw[4:].strip()
-            path = target[2:] if target.startswith("b/") else (
+            old_path = target[2:] if target.startswith("a/") else (
                 None if target == "/dev/null" else target)
+        elif raw.startswith("+++ "):
+            target = raw[4:].strip()
+            # A fully deleted file (`+++ /dev/null`) is still anchorable on
+            # side LEFT via its old path.
+            path = target[2:] if target.startswith("b/") else (
+                old_path if target == "/dev/null" else target)
             in_hunk = False
         elif raw.startswith("@@"):
-            # @@ -a,b +c,d @@ — c is the first new-side line of the hunk.
+            # @@ -a,b +c,d @@ — a/c are the first old/new-side hunk lines.
             try:
+                old_part = raw.split("-", 1)[1].split(" ", 1)[0]
                 new_part = raw.split("+", 1)[1].split(" ", 1)[0]
+                old_line = int(old_part.split(",", 1)[0])
                 new_line = int(new_part.split(",", 1)[0])
                 in_hunk = path is not None
             except (IndexError, ValueError):
                 in_hunk = False
         elif in_hunk:
             if raw.startswith("+"):
-                added.setdefault(path, []).append(new_line)
+                anchors.setdefault(path, {"added": [], "deleted": []})[
+                    "added"].append(new_line)
                 new_line += 1
-            elif raw.startswith("-") or raw.startswith("\\"):
-                pass  # old-side / "no newline" marker: no new-side line
+            elif raw.startswith("-"):
+                anchors.setdefault(path, {"added": [], "deleted": []})[
+                    "deleted"].append(old_line)
+                old_line += 1
+            elif raw.startswith("\\"):
+                pass  # "no newline" marker: belongs to no side
             else:
-                new_line += 1  # context line
-    return added
+                new_line += 1  # context line exists on both sides
+                old_line += 1
+    return anchors
 
 
 def build_inline_candidates(bundle: dict, structured, diff_text: str) -> list[dict]:
     """One inline comment per changed symbol that has callers AND an anchorable
-    added line inside its span. Symbols that miss either fold back into the
-    summary comment."""
-    anchors = diff_added_lines(diff_text)
+    diff line inside its span — an added line (side RIGHT) when the change adds
+    code, a deleted line (side LEFT) for deletion-only changes. Symbols that
+    miss either fold back into the summary comment."""
+    anchors = diff_anchor_lines(diff_text)
     out = []
     for ch in bundle.get("changed") or []:
-        lines = anchors.get(ch.get("path")) or []
-        start = ch.get("start_line") or 0
-        end = ch.get("end_line") or 0
-        anchor = next((ln for ln in lines if start <= ln <= end), None)
-        if anchor is None:
-            continue
         callers = callers_of(bundle, ch.get("name"))
         if not callers:
+            continue
+        file_anchors = anchors.get(ch.get("path")) or {"added": [], "deleted": []}
+        start = ch.get("start_line") or 0
+        end = ch.get("end_line") or 0
+        anchor = next((ln for ln in file_anchors["added"] if start <= ln <= end), None)
+        side = "RIGHT"
+        if anchor is None:
+            # Deletion-only change: pin to a removed line. Old-side numbers vs
+            # the symbol's new-side span is the same approximation the indexer
+            # itself uses to flag the symbol as changed.
+            anchor = next((ln for ln in file_anchors["deleted"]
+                           if start <= ln <= end), None)
+            side = "LEFT"
+        if anchor is None:
+            print(f"[zenik] no anchorable diff line for `{ch.get('name')}` "
+                  f"({ch.get('path')}); its detail stays in the summary comment")
             continue
         out.append({
             "path": ch.get("path"),
             "line": anchor,
+            "side": side,
             "body": build_inline_body(ch, callers, note_for(structured, ch.get("name"))),
         })
     return out
@@ -424,7 +461,7 @@ def post_pr_review(full_name: str, pr_number: int, head_sha: str,
             "commit_id": head_sha,
             "event": "COMMENT",
             "comments": [
-                {"path": c["path"], "line": c["line"], "side": "RIGHT",
+                {"path": c["path"], "line": c["line"], "side": c["side"],
                  "body": c["body"]}
                 for c in comments
             ],
