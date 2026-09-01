@@ -19,26 +19,48 @@ it does the work where the client's code lives, so the code never leaves.
 
 ---
 
-## Walk one PR through the whole loop
+## Two modes, one action
+
+The same action runs on two triggers, doing two different jobs:
+
+- **`push` to the default branch (and `workflow_dispatch`)** — *keep the graph
+  fresh.* The stored dependency graph on the platform mirrors **main**. On every
+  merge, the action re-parses the repo (seconds), asks the platform which chunk
+  hashes it already has (`GET /v1/index/manifest`), embeds **only the new or
+  changed chunks**, and uploads — unchanged chunks ship without vectors and the
+  platform reuses the stored ones. A steady-state refresh looks like this:
+
+  ```
+  [zenik] 1145 chunk(s) parsed; 1114 already stored; 0 to embed
+  [zenik] index updated: {'symbols': 1368, 'edges': 4488, 'chunks': 1145, 'embeddings_reused': 1145}
+  ```
+
+  Zero embedding calls, a tiny upload, done in under a minute. The **first-ever**
+  push run finds an empty manifest and indexes everything — that IS onboarding:
+  merging the workflow file itself triggers it.
+
+- **`pull_request`** — *query the graph, write nothing.* A PR run never uploads
+  an index, so PRs can't pollute the graph and cost scales with the diff, not
+  the repo.
+
+---
+
+## Walk one PR through the query loop
 
 A developer on the `meridian` repo edits `exponent_for` — the function that says
 "how many decimal places does this currency have." They open a PR. Here is what
 `zenik-action` does, step by step.
 
-### Step 1 — Build the index (of the checked-out repo)
-
-The action runs the **vendored** indexer over the checkout:
+### Step 1 — Parse the checkout (no embedding, no upload)
 
 ```
-[zenik] building index with embedder: text-embedding-3-small
+[zenik] query mode: parsing checkout (no index upload)
 [indexer] parsed 197 files -> 1368 symbols, 1145 chunks; resolving edges...
-[zenik] POST /v1/index  ({'symbols': 1368, 'edges': 4488, 'chunks': 1145})
 ```
 
-That derived index — names, line numbers, dependency edges, and one embedding
-per function — is POSTed to the platform. **The source code itself is never
-sent.** (You can prove it: every chunk in the payload has an `embedding` and a
-`content_hash`, but no `text` field.)
+The parse is cheap (tree-sitter, a few seconds). It exists so the run can find
+the changed function's chunk text and so there is a local fallback if the
+platform is unreachable. **The source code itself never leaves the runner.**
 
 ### Step 2 — Turn the diff into "changed symbols"
 
@@ -54,7 +76,9 @@ function changed.
 
 ### Step 3 — Ask the platform for the blast radius
 
-It POSTs those changed symbols to `/v1/impact` and gets back the **context
+It embeds JUST the changed chunk (one OpenAI call — the PR's new code isn't in
+the stored graph, so the semantic search needs its fresh vector) and POSTs the
+changed symbols + that query vector to `/v1/impact`. Back comes the **context
 bundle**: everything that might be affected, fused from two signals —
 
 - **provable edges** — who literally calls `exponent_for`, and
@@ -62,8 +86,8 @@ bundle**: everything that might be affected, fused from two signals —
   math, which no import connects.
 
 ```
-[zenik] POST /v1/impact  (1 changed symbol(s))
-  26 potentially affected site(s), 17 cross-service
+[zenik] POST /v1/impact  (1 changed symbol(s), 1 fresh query vector(s))
+  27 potentially affected site(s), 19 cross-service
 ```
 
 The cross-service ones are the point: a human reviewing this PR sees the direct
@@ -142,19 +166,26 @@ can see exactly what left their runner.
 PR opened
    │
    ▼
-build_index (vendored)  ──POST──▶  /v1/index      (derived index, no source)
-   │
-changed_symbols (diff)  ──POST──▶  /v1/impact  ──▶ context bundle (blast radius)
-   │                                                   │
-   ▼                                                   ▼
+push to main:
+  build_index(embed=False) ──GET──▶ /v1/index/manifest (stored chunk hashes)
+  embed ONLY new hashes    ──POST─▶ /v1/index          (delta; platform reuses
+                                                        stored embeddings)
+pull_request:
+  build_index(embed=False)          (parse only — nothing uploaded)
+  changed_symbols (diff) + fresh query vectors
+                           ──POST─▶ /v1/impact ──▶ context bundle (blast radius)
+                                                       │
+                                                       ▼
 build_findings_prompt(diff + bundle)  ──▶  coding agent (Codex/Claude)  ──▶ prose
    │
    ▼
-PR comment + commit status (client's GITHUB_TOKEN)     /v1/telemetry (counts only)
+inline review comments + summary comment + commit status   /v1/telemetry (counts)
 ```
 
-If `/v1/impact` can't be reached, the action computes the blast radius **locally**
-from the index it just built — same engine, so the PR still gets an answer.
+If `/v1/impact` can't be reached (or the repo was never indexed — merge/run the
+workflow on main first), the action computes a **deterministic-only** blast
+radius locally from the parse — the PR still gets an answer, minus the semantic
+layer.
 
 ---
 
@@ -196,9 +227,11 @@ OPENAI_API_KEY=sk-...           # for embeddings + the Codex agent (optional) \
   python run_zenik.py
 ```
 
-With `ZENIK_DRY_RUN=1` and no `ZENIK_API_URL`, it builds the index, computes the
-blast radius locally, runs the agent if a key is set, and writes the comment to
-`zenik_change_impact.md` next to the checkout instead of posting to GitHub.
+With `ZENIK_DRY_RUN=1` and no `ZENIK_API_URL`, it parses the checkout, computes
+a deterministic-only blast radius locally, runs the agent if a key is set, and
+writes the comment to `zenik_change_impact.md` next to the checkout instead of
+posting to GitHub. Add `ZENIK_MODE=index` to exercise the graph-refresh mode
+instead (parse → manifest → embed-new-only → upload).
 
 ---
 
