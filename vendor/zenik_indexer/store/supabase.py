@@ -116,13 +116,15 @@ class SupabaseStore:
         """The content hashes of a repo's stored chunks. The client compares
         these against its freshly parsed chunks and embeds ONLY the hashes we
         don't already have — the heart of incremental indexing."""
-        with self.conn().cursor() as cur:
+        with self._conn.cursor() as cur:
             cur.execute(
                 "select distinct content_hash from chunks "
                 "where repo_id = %s and embedding is not null",
                 (repo_id,),
             )
-            return [r[0] for r in cur.fetchall()]
+            rows = [r[0] for r in cur.fetchall()]
+        self._conn.commit()  # end the read transaction (autocommit is off)
+        return rows
 
     # -- write path ---------------------------------------------------------
     def replace_index(self, repo_id: str, result: IndexResult) -> dict:
