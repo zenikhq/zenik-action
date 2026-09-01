@@ -137,13 +137,17 @@ marked [CROSS-SERVICE] live in a different top-level service/dir — those are t
 
 ## Your task — findings + per-caller guidance (prose, no code changes)
 
+Your findings are split across the PR: a short note is pinned INLINE on each
+changed symbol's diff hunk, and one compact summary comment covers the rest.
+So keep every piece brief — the inline note is what a reviewer reads first.
+
 Produce a concise report with these parts:
 
 1. **One-line summary** — what changed and how wide the blast radius is
    (e.g. "changes `charge()`; affects N call sites across M services").
 
 2. **Per-site guidance** — for EACH impacted site you judge to be genuinely
-   affected, one short paragraph or bullet stating:
+   affected, one short bullet stating:
    - *what* is affected (which caller / service / test), and
    - *why it is risky* — trace it to the specific change. Be concrete:
      "this caller still passes the old 2-arg signature and will need the new
@@ -153,12 +157,36 @@ Produce a concise report with these parts:
    the wins.
 
 3. **Pruned candidates** — list any candidate sites you concluded are NOT
-   actually affected (especially `semantic` look-alikes that just resemble the
-   changed code), with one clause each on why you dropped them. Pruning false
-   positives is as valuable as finding real ones.
+   actually affected, with one clause each on why you dropped them. Pruning
+   false positives is as valuable as finding real ones. `semantic` look-alikes
+   deserve one extra distinction: code that INDEPENDENTLY implements the same
+   logic as the changed code (a parallel implementation that should be kept in
+   sync by hand) is NOT pruned noise — put it in `parallel` in the JSON block
+   below instead.
 
 4. **Tests to run** — the likely-relevant tests a reviewer should run before
    merging.
+
+## Machine-readable block — REQUIRED, last thing in your reply
+
+End your reply with exactly one fenced ```json block (nothing after it):
+
+```json
+{{
+  "per_symbol": [
+    {{"name": "<changed symbol name>", "note": "<1-3 plain sentences: the real risk for this symbol's callers. Simple technical English. State the problem directly; no hedging, no jargon padding.>"}}
+  ],
+  "parallel": [
+    {{"path": "<file>", "line": <line>, "why": "<one clause: what logic it duplicates>"}}
+  ],
+  "overall": "<1-2 sentences for the summary comment>"
+}}
+```
+
+One `per_symbol` entry per changed symbol (use the exact symbol names listed
+above). If a symbol's change is harmless, say so in its note in a few words.
+`parallel` may be empty. The notes are posted verbatim as inline PR comments —
+write them for the developer, not for a log.
 
 ## Hard rules — read these
 

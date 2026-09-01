@@ -50,7 +50,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 import telemetry  # noqa: E402
 from agent_backends import AgentResult, select_backend  # noqa: E402
 from prompt import build_findings_prompt  # noqa: E402
-from report import COMMENT_MARKER, build_report, check_summary  # noqa: E402
+from report import (COMMENT_MARKER, INLINE_MARKER, build_inline_body,  # noqa: E402
+                    build_report, callers_of, check_summary, note_for,
+                    parse_agent_message)
 
 from zenik_indexer import build_index, changed_symbols, compute_impact  # noqa: E402
 from zenik_indexer.embeddings import get_embedder  # noqa: E402
@@ -142,6 +144,69 @@ def pr_diff_text(repo_path: Path, base: Optional[str], head: Optional[str]) -> s
         return proc.stdout if proc.returncode == 0 else ""
     except Exception:
         return ""
+
+
+# ---------------------------------------------------------------------------
+# Inline anchoring — which diff lines an inline review comment may pin to.
+# ---------------------------------------------------------------------------
+def diff_added_lines(diff_text: str) -> dict[str, list[int]]:
+    """Per new-side file path, the ADDED line numbers in the unified diff.
+
+    GitHub review comments only attach to lines present in the PR diff; added
+    lines (side RIGHT) are the safe anchors. An invalid anchor 422s the whole
+    review, so we only ever pin to lines this parse proves are in the diff.
+    """
+    added: dict[str, list[int]] = {}
+    path = None
+    new_line = 0
+    in_hunk = False
+    for raw in (diff_text or "").splitlines():
+        if raw.startswith("+++ "):
+            target = raw[4:].strip()
+            path = target[2:] if target.startswith("b/") else (
+                None if target == "/dev/null" else target)
+            in_hunk = False
+        elif raw.startswith("@@"):
+            # @@ -a,b +c,d @@ — c is the first new-side line of the hunk.
+            try:
+                new_part = raw.split("+", 1)[1].split(" ", 1)[0]
+                new_line = int(new_part.split(",", 1)[0])
+                in_hunk = path is not None
+            except (IndexError, ValueError):
+                in_hunk = False
+        elif in_hunk:
+            if raw.startswith("+"):
+                added.setdefault(path, []).append(new_line)
+                new_line += 1
+            elif raw.startswith("-") or raw.startswith("\\"):
+                pass  # old-side / "no newline" marker: no new-side line
+            else:
+                new_line += 1  # context line
+    return added
+
+
+def build_inline_candidates(bundle: dict, structured, diff_text: str) -> list[dict]:
+    """One inline comment per changed symbol that has callers AND an anchorable
+    added line inside its span. Symbols that miss either fold back into the
+    summary comment."""
+    anchors = diff_added_lines(diff_text)
+    out = []
+    for ch in bundle.get("changed") or []:
+        lines = anchors.get(ch.get("path")) or []
+        start = ch.get("start_line") or 0
+        end = ch.get("end_line") or 0
+        anchor = next((ln for ln in lines if start <= ln <= end), None)
+        if anchor is None:
+            continue
+        callers = callers_of(bundle, ch.get("name"))
+        if not callers:
+            continue
+        out.append({
+            "path": ch.get("path"),
+            "line": anchor,
+            "body": build_inline_body(ch, callers, note_for(structured, ch.get("name"))),
+        })
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -334,6 +399,44 @@ def post_pr_comment(full_name: str, pr_number: int, body: str, token: str) -> bo
     return res is not None
 
 
+def post_pr_review(full_name: str, pr_number: int, head_sha: str,
+                   comments: list[dict], token: str) -> bool:
+    """Post the inline findings as ONE review (event COMMENT). Reviews can't be
+    PATCHed like issue comments, so re-runs first delete the previous run's
+    inline comments (found via INLINE_MARKER) and post fresh."""
+    api = _github_api()
+    listed = _gh_request(
+        "GET",
+        f"{api}/repos/{full_name}/pulls/{pr_number}/comments?per_page=100",
+        token,
+    )
+    if isinstance(listed, list):
+        for c in listed:
+            if INLINE_MARKER in (c.get("body") or ""):
+                _gh_request(
+                    "DELETE",
+                    f"{api}/repos/{full_name}/pulls/comments/{c.get('id')}",
+                    token,
+                )
+
+    res = _gh_request(
+        "POST", f"{api}/repos/{full_name}/pulls/{pr_number}/reviews", token, {
+            "commit_id": head_sha,
+            "event": "COMMENT",
+            "comments": [
+                {"path": c["path"], "line": c["line"], "side": "RIGHT",
+                 "body": c["body"]}
+                for c in comments
+            ],
+        },
+    )
+    if res is not None:
+        print(f"[zenik] posted review with {len(comments)} inline comment(s)")
+        return True
+    print("[zenik] review post failed; folding detail into the summary comment")
+    return False
+
+
 def post_commit_status(full_name: str, sha: str, description: str, token: str) -> bool:
     """Post a commit status (the 'check') on the PR head sha. A commit status
     works with the plain GITHUB_TOKEN, unlike the Checks API which needs a
@@ -426,10 +529,11 @@ def main() -> None:
     cross = sum(1 for it in impacted if it.get("cross_service"))
 
     # 5. Findings agent — prose only, no edits.
+    diff_text = pr_diff_text(ctx.repo_path, ctx.base, ctx.head)
     agent_result = None
     outcome = telemetry.OUTCOME_NO_IMPACT
     if impacted or tests:
-        prompt = build_findings_prompt(pr_diff_text(ctx.repo_path, ctx.base, ctx.head), bundle)
+        prompt = build_findings_prompt(diff_text, bundle)
         agent_result = run_agent(prompt)
         if agent_result is None:
             print("[zenik] No agent key configured (set OPENAI_API_KEY or "
@@ -448,10 +552,36 @@ def main() -> None:
     else:
         print("[zenik] blast radius is empty; skipping the agent.")
 
-    # 6. Build the comment and post it (comment + commit status).
+    # 6. Post the findings: inline review comments on the changed hunks first,
+    # then the (now shorter) summary comment + commit status. Any failure on
+    # the review path folds the detail back into the summary — never lose it.
+    prose, structured = None, None
+    if agent_result is not None and agent_result.ok:
+        prose, structured = parse_agent_message(agent_result.final_message or "")
+        if structured is None and (agent_result.final_message or "").strip():
+            print("[zenik] agent reply had no parseable JSON block; using the "
+                  "single-comment layout")
+
+    inline = build_inline_candidates(bundle, structured, diff_text) if impacted else []
+
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    dry = os.environ.get("ZENIK_DRY_RUN") == "1"
+    can_post = (bool(token) and not dry and ctx.full_name
+                and ctx.pr_number is not None and ctx.head)
+    inline_posted = False
+    if inline and can_post:
+        inline_posted = post_pr_review(
+            ctx.full_name, ctx.pr_number, ctx.head, inline, token)
+    elif inline:
+        print(f"[zenik] not posting {len(inline)} inline comment(s) "
+              "(dry run / no token); bodies follow:\n")
+        for c in inline:
+            print(f"--- {c['path']}:{c['line']} ---\n{c['body']}")
+
     body = build_report(
         bundle=bundle, agent_result=agent_result, outcome=outcome,
         pr_number=ctx.pr_number, truncated=bool(bundle.get("truncated")),
+        agent_prose=prose, structured=structured, inline_posted=inline_posted,
     )
     summary = check_summary(bundle, outcome)
     publish_findings(ctx, body, summary)

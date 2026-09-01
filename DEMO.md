@@ -85,27 +85,39 @@ several ways, **not to edit anything** — this is a report, not a fix.
 
 ### Step 5 — Post it on the PR
 
-The findings become a PR **comment** plus a `zenik/change-impact` **commit
-status**, authored by the client's own `github-actions[bot]`:
+The findings land on the PR in three pieces, all authored by the client's own
+`github-actions[bot]`:
 
-```
-## Zenik — change impact
+1. **Inline review comments on the changed code.** Each changed symbol gets one
+   short comment pinned on its own diff hunk — headline caller counts, the
+   agent's note in plain English (1–3 sentences, states the problem directly),
+   and the caller list folded into a `<details>`:
 
-**1** changed symbol(s) → **26** potentially affected site(s) across **2**
-service area(s), **17** cross-service ⚠.
+   ```
+   Zenik — `exponent_for`: 6 caller(s), 1 cross-service ⚠.
 
-### Blast radius
-- `services/reconciliation/app/domain/tolerance.py:79` — `tolerance_minor` (calls_maybe)
-- `packages/ts-sdk/src/http.ts:128` — `HttpTransport` (semantic) ⚠ cross-service
-- `services/ledger-core/src/clients/catalogClient.ts:61` — `CatalogClient` (semantic) ⚠ cross-service
-  … 20 more
+   Callers that pass strict=True will now raise ValueError on unknown
+   currencies. to_major uses the default and is safe.
 
-### Findings & guidance
-> the agent's prose about each affected site …
-```
+   ▸ Callers
+   ```
 
-Re-running on the same PR **updates** that comment instead of stacking a new one
-(it finds its own comment by a hidden marker).
+   (GitHub only allows inline comments on lines that are in the diff — and the
+   callers themselves are *unchanged* code — so the comments pin to the changed
+   symbol's hunk and point outward at its callers.)
+
+2. **One short summary comment** — the counts headline, likely-relevant tests,
+   and a **"Parallel implementations — keep in sync"** section for code the
+   agent found that independently implements the same logic (not blast radius,
+   not noise — a reminder), plus the trust footer.
+
+3. A `zenik/change-impact` **commit status**.
+
+Re-running on the same PR replaces its own output instead of stacking: the
+summary comment is updated in place, and the previous run's inline comments are
+found (by a hidden marker), deleted, and re-posted fresh. If the inline review
+can't be posted for any reason, everything folds back into a single full
+comment — the old layout — so the report is never lost.
 
 ### Step 6 — Report counts, never names
 

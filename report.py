@@ -21,9 +21,16 @@ left the building.
 """
 from __future__ import annotations
 
+import json
+import re
+
 # Keep the inline blast-radius list readable in a PR comment; the full set is
 # always in the dashboard / the job log.
 _MAX_LISTED = 25
+
+# Callers listed inside one inline comment's <details>; the rest go to the
+# dashboard. Inline comments must stay short or they defeat their purpose.
+_MAX_INLINE_CALLERS = 10
 
 
 def _counts(bundle: dict) -> dict:
@@ -103,10 +110,113 @@ def _tests_list(bundle: dict) -> list[str]:
 # of stacking duplicates. Kept as an HTML comment so it is invisible in render.
 COMMENT_MARKER = "<!-- zenik-action:change-impact -->"
 
+# Same idea for the inline review comments: review comments can't be PATCHed the
+# way issue comments can, so re-runs find comments carrying this marker, delete
+# them, and post a fresh review.
+INLINE_MARKER = "<!-- zenik-inline -->"
+
+_JSON_FENCE = re.compile(r"```json\s*\n(.*?)```", re.DOTALL)
+
+
+def parse_agent_message(text):
+    """Split the agent's reply into (prose, structured-dict-or-None).
+
+    The prompt asks for a trailing ```json block with per-symbol notes. Parse
+    the LAST such block leniently; on any failure return the full text as prose
+    and None — the report then degrades to the single-comment layout.
+    """
+    if not (text or "").strip():
+        return "", None
+    matches = list(_JSON_FENCE.finditer(text))
+    for m in reversed(matches):
+        try:
+            data = json.loads(m.group(1))
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(data, dict) and isinstance(data.get("per_symbol"), list):
+            prose = (text[:m.start()] + text[m.end():]).strip()
+            return prose, data
+    return text.strip(), None
+
+
+def note_for(structured, name: str):
+    for entry in (structured or {}).get("per_symbol") or []:
+        if isinstance(entry, dict) and entry.get("name") == name:
+            note = (entry.get("note") or "").strip()
+            return note or None
+    return None
+
+
+def callers_of(bundle: dict, name: str) -> list[dict]:
+    """The impacted items that trace back to changed symbol `name` (via)."""
+    out = []
+    for it in bundle.get("impacted") or []:
+        if name in (it.get("via") or []):
+            out.append(it)
+    return out
+
+
+def build_inline_body(changed: dict, callers: list[dict], note) -> str:
+    """One inline review comment, pinned on the changed symbol's diff hunk.
+
+    Kept deliberately brief: headline counts, the agent's note (1-3 plain
+    sentences), and the caller list folded away. The reviewer should get the
+    point without scrolling.
+    """
+    name = changed.get("name")
+    cross = sum(1 for c in callers if c.get("cross_service"))
+    head = f"**Zenik** — `{name}`: **{len(callers)}** caller(s)"
+    if cross:
+        head += f", {cross} cross-service ⚠"
+    head += "."
+
+    lines = [INLINE_MARKER, head]
+    if note:
+        lines += ["", note]
+    if callers:
+        lines += ["", "<details><summary>Callers</summary>", ""]
+        for it in callers[:_MAX_INLINE_CALLERS]:
+            s = it.get("symbol") or {}
+            flag = " ⚠" if it.get("cross_service") else ""
+            lines.append(f"- `{s.get('path')}:{s.get('start_line')}` — "
+                         f"`{s.get('name')}` ({it.get('reason')}){flag}")
+        if len(callers) > _MAX_INLINE_CALLERS:
+            lines.append(f"- … {len(callers) - _MAX_INLINE_CALLERS} more "
+                         f"(see the Zenik dashboard)")
+        lines += ["", "</details>"]
+    return "\n".join(lines) + "\n"
+
+
+def _parallel_section(structured) -> list[str]:
+    """The third category: code that independently implements the same logic.
+    Not blast radius, not noise — a keep-in-sync reminder."""
+    items = [p for p in (structured or {}).get("parallel") or []
+             if isinstance(p, dict) and p.get("path")]
+    if not items:
+        return []
+    out = ["", "### Parallel implementations — keep in sync", "",
+           "_Not affected by this change, but they implement the same logic "
+           "independently. If the rule changed, change them too._", ""]
+    for p in items[:_MAX_LISTED]:
+        loc = p.get("path")
+        if p.get("line"):
+            loc = f"{loc}:{p['line']}"
+        why = (p.get("why") or "").strip()
+        out.append(f"- `{loc}`" + (f" — {why}" if why else ""))
+    return out
+
 
 def build_report(*, bundle: dict, agent_result, outcome: str,
-                 pr_number=None, truncated: bool = False) -> str:
-    """Return the Markdown body for the PR comment."""
+                 pr_number=None, truncated: bool = False,
+                 agent_prose=None, structured=None,
+                 inline_posted: bool = False) -> str:
+    """Return the Markdown body for the summary PR comment.
+
+    With `inline_posted` the per-symbol detail lives in inline review comments
+    on the diff, so this stays a short overview. Without it (review post failed,
+    or nothing was anchorable) this carries the full detail as before.
+    `agent_prose` is the agent's reply with the machine JSON block stripped.
+    """
     c = _counts(bundle)
 
     summary = (
@@ -134,26 +244,36 @@ def build_report(*, bundle: dict, agent_result, outcome: str,
             "",
         ]
 
-    lines += ["### Blast radius", ""]
-    lines += _impact_list(bundle)
-    lines += _tests_list(bundle)
+    if inline_posted:
+        # Per-symbol detail is pinned inline on the diff; keep this an overview.
+        lines += ["_Per-symbol findings are pinned inline on the changed code._",
+                  ""]
+        overall = ((structured or {}).get("overall") or "").strip()
+        prose = overall or (agent_prose or "").strip()
+        if prose:
+            lines += ["### Findings", "", prose]
+        lines += _tests_list(bundle)
+    else:
+        lines += ["### Blast radius", ""]
+        lines += _impact_list(bundle)
+        lines += _tests_list(bundle)
 
-    # The agent's prose findings — the level-2 guidance.
-    if agent_result is not None and agent_result.final_message:
-        lines += [
-            "",
-            "### Findings & guidance",
-            "",
-            agent_result.final_message.strip(),
-        ]
-    elif agent_result is not None and agent_result.ok:
-        lines += [
-            "",
-            "### Findings & guidance",
-            "",
-            "_The agent completed but returned no summary text. The blast radius "
-            "above is the index's own answer._",
-        ]
+        # The agent's prose findings — the level-2 guidance.
+        prose = (agent_prose if agent_prose is not None
+                 else (agent_result.final_message or "")
+                 if agent_result is not None else "").strip()
+        if agent_result is not None and prose:
+            lines += ["", "### Findings & guidance", "", prose]
+        elif agent_result is not None and agent_result.ok:
+            lines += [
+                "",
+                "### Findings & guidance",
+                "",
+                "_The agent completed but returned no summary text. The blast "
+                "radius above is the index's own answer._",
+            ]
+
+    lines += _parallel_section(structured)
 
     if outcome == "agent_failed":
         err = (agent_result.error if agent_result else "unknown error")[:1500]
