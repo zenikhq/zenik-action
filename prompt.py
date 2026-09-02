@@ -202,3 +202,85 @@ write them for the developer, not for a log.
   reads in thirty seconds. No preamble, no restating these instructions.
 
 Reply with ONLY the report."""
+
+
+def _fmt_findings(findings: list[str]) -> str:
+    if not findings:
+        return ("(no prior Zenik findings comments were found on the PR — "
+                "work from the blast radius above)")
+    joined = "\n\n---\n\n".join(f.strip() for f in findings)
+    if len(joined) > 8000:
+        joined = joined[:8000] + "\n... (findings truncated)"
+    return joined
+
+
+def build_fix_prompt(diff_text: str, bundle: dict, findings: list[str],
+                     scope: list[str]) -> str:
+    """The `/zenik fix` prompt — the inverse of the findings prompt: editing is
+    now the JOB, but only what the findings implicate, as minimally as possible.
+    The orchestrator additionally enforces the file scope in code (out-of-scope
+    edits are reverted), so the prompt and the harness agree."""
+    changed = bundle.get("changed") or []
+    impacted = bundle.get("impacted") or []
+    tests = bundle.get("tests") or []
+
+    diff_blob = (diff_text or "").strip()
+    if len(diff_blob) > _MAX_DIFF_CHARS:
+        diff_blob = (diff_blob[:_MAX_DIFF_CHARS]
+                     + "\n... (diff truncated; read the files directly for the rest)")
+
+    scope_note = (
+        f"\n\nThe requester scoped this run to: {', '.join(f'`{s}`' for s in scope)}."
+        " Only act on findings about those changed symbols." if scope else ""
+    )
+
+    return f"""You are running inside a CI job on a pull request, invoked by a maintainer
+who commented `/zenik fix`. A previous Zenik run reported this change's blast
+radius and per-caller guidance. Your job now is to **apply those fixes to the
+affected code** — edit files, carefully and minimally.{scope_note}
+
+## What the PR changed (diff)
+
+```diff
+{diff_blob}
+```
+
+## Changed symbols
+
+{_fmt_changed(changed)}
+
+## Blast radius — the sites the fixes are FOR
+
+{_fmt_impacted(impacted)}
+
+## Likely-relevant tests
+
+{_fmt_tests(tests)}
+
+## Zenik's prior findings on this PR (what the maintainer is asking you to apply)
+
+{_fmt_findings(findings)}
+
+## Your task
+
+For each genuinely affected site in the blast radius, apply the fix the
+findings describe (or the fix the code plainly needs once you read it):
+update callers to the changed behaviour, keep parallel logic consistent where
+a finding says so, and update the flagged tests if they now assert stale
+behaviour. Read the real code at every site before editing it.
+
+## Hard rules — read these
+
+- **Edit ONLY files named in the blast radius above** (the changed files, the
+  impacted sites, the flagged tests). The harness reverts anything else, so
+  out-of-scope edits are wasted work. Never touch `.github/`.
+- **Minimal diffs.** No reformatting, no renames, no refactors, no new
+  dependencies, no drive-by cleanups. A reviewer must be able to map every
+  hunk you produce to a finding.
+- Do NOT run `git commit`/`git push` — the harness commits for you. Running
+  the repo's tests to check your work is fine and encouraged.
+- If a finding is wrong or a fix would be risky, SKIP it and say why in your
+  summary rather than forcing a bad edit.
+
+End your reply with a short summary for the PR thread: what you changed per
+file, what you skipped and why. Plain technical English, no preamble."""

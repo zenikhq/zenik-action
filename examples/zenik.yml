@@ -1,6 +1,6 @@
 # Example client workflow — drop this in your repo at .github/workflows/zenik.yml
 #
-# Two modes from one workflow:
+# Three modes from ONE workflow:
 #   pull_request      — Zenik computes the change's blast radius against the
 #                       stored graph and posts inline findings + a summary on
 #                       the PR (read-only; nothing is uploaded).
@@ -8,6 +8,9 @@
 #                       and uploads ONLY chunks whose content changed. The very
 #                       first push run indexes everything — that's onboarding
 #                       (merging THIS file to your default branch triggers it).
+#   /zenik fix        — a maintainer comments `/zenik fix` on a PR and Zenik's
+#                       agent applies the reported fixes as a commit on the PR
+#                       branch (opt-in per invocation; you review the diff).
 #
 # Required repository secrets (Settings → Secrets and variables → Actions):
 #   ZENIK_CLIENT_KEY   — your Zenik client key (machine credential for the platform)
@@ -23,17 +26,30 @@ on:
   push:
     branches: [main]        # keep in sync with your default branch
   workflow_dispatch:         # manual "index now" button for onboarding
+  issue_comment:
+    types: [created]         # the `/zenik fix` command
 
-# The action posts a PR comment and a commit status as your own
-# github-actions[bot], so the default token needs these scopes.
+# contents: write exists ONLY for `/zenik fix` pushing its commit to the PR
+# branch; the analysis paths never write. The token still cannot modify
+# .github/workflows, and fix runs are permission-gated to maintainers inside.
 permissions:
-  contents: read
+  contents: write
   pull-requests: write
   statuses: write
+
+# Serialize runs per PR so a duplicate `/zenik fix` can't race the first one.
+concurrency:
+  group: zenik-${{ github.event.issue.number || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
 
 jobs:
   zenik:
     runs-on: ubuntu-latest
+    # For comment events, only act on PR comments that start with `/zenik` —
+    # everything else exits without spending a runner minute on setup.
+    if: >
+      github.event_name != 'issue_comment' ||
+      (github.event.issue.pull_request && startsWith(github.event.comment.body, '/zenik'))
     steps:
       - name: Check out the PR
         uses: actions/checkout@v4

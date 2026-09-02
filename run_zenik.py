@@ -632,12 +632,17 @@ def main() -> None:
     client_key = os.environ.get("ZENIK_CLIENT_KEY", "")
     api_url = os.environ.get("ZENIK_API_URL", "")
 
-    # Two modes, one action: a push to the default branch refreshes the stored
-    # graph (write path); a pull_request queries it (read path — no upload).
+    # Three modes, one action: a push to the default branch refreshes the
+    # stored graph (write path); a pull_request queries it (read path — no
+    # upload); a `/zenik fix` PR comment runs the opt-in fix agent.
     event = (os.environ.get("ZENIK_MODE") or
              os.environ.get("GITHUB_EVENT_NAME") or "").strip()
     if event in ("push", "workflow_dispatch", "index"):
         run_index_update(ctx, api_url, client_key, started)
+        return
+    if event in ("issue_comment", "fix"):
+        from fix import run_fix
+        run_fix()
         return
 
     print(f"[zenik] repo={ctx.full_name or '(unknown)'} "

@@ -287,6 +287,15 @@ def build_report(*, bundle: dict, agent_result, outcome: str,
             "index, not the agent), but the prose guidance is missing for this run.",
         ]
 
+    # The opt-in fix affordance — only when there is something to fix.
+    if c["impacted"] and outcome != "agent_failed":
+        lines += [
+            "",
+            "> 💡 To have Zenik apply these fixes to this branch, comment "
+            "`/zenik fix` — or `/zenik fix <symbol>` to scope it. "
+            "Requires write access; you review the diff.",
+        ]
+
     # Footer: engine, cost, and the trust note.
     lines += ["", "---", ""]
     lines.append(f"**Analysis by:** {_agent_line(agent_result)}")
