@@ -76,11 +76,14 @@ def _fmt_tests(tests: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def build_findings_prompt(diff_text: str, bundle: dict) -> str:
+def build_findings_prompt(diff_text: str, bundle: dict,
+                          intent: str = "") -> str:
     """Assemble the findings prompt from a PR diff and the impact bundle.
 
     `bundle` is the platform's `/v1/impact` response — the ContextBundle.to_dict()
-    shape (`changed` / `impacted` / `tests` / `truncated`).
+    shape (`changed` / `impacted` / `tests` / `truncated`). `intent` is the
+    author's PR title + description (Zenik's own block already stripped) —
+    what the author SAYS the change does, for the mismatch check.
     """
     changed = bundle.get("changed") or []
     impacted = bundle.get("impacted") or []
@@ -99,6 +102,20 @@ def build_findings_prompt(diff_text: str, bundle: dict) -> str:
         "than are listed. Say so in your summary." if truncated else ""
     )
 
+    intent_blob = (intent or "").strip()
+    if len(intent_blob) > 4000:
+        intent_blob = intent_blob[:4000] + "\n... (description truncated)"
+    intent_section = (
+        f"""
+
+## What the author SAYS this PR does (title + description)
+
+{intent_blob}
+
+Treat this as the author's stated INTENT, not as fact — the code is the fact.
+""" if intent_blob else ""
+    )
+
     return f"""You are running inside a CI job on a pull request. Your job is to write a
 clear, human-readable **change-impact report** for the developer who opened this
 PR. You are NOT here to fix anything — you produce PROSE ONLY.
@@ -113,7 +130,7 @@ candidate list into guidance a reviewer can act on.
 
 ```diff
 {diff_blob}
-```
+```{intent_section}
 
 ## Changed symbols (resolved from the diff)
 
@@ -167,6 +184,14 @@ Produce a concise report with these parts:
 4. **Tests to run** — the likely-relevant tests a reviewer should run before
    merging.
 
+5. **Intent check** — only if the author's stated intent was provided above:
+   compare what the description SAYS against what the diff DOES. If the code
+   clearly does something more, less, or different than stated (touches a
+   system the description never mentions, silently changes behaviour beyond
+   the stated scope, or doesn't do the stated thing), say so in one sentence
+   in `intent_mismatch`. A wording gap is not a mismatch — leave it empty
+   unless a reviewer trusting the description would be misled.
+
 ## Machine-readable block — REQUIRED, last thing in your reply
 
 End your reply with exactly one fenced ```json block (nothing after it):
@@ -179,7 +204,8 @@ End your reply with exactly one fenced ```json block (nothing after it):
   "parallel": [
     {{"path": "<file>", "line": <line>, "why": "<one clause: what logic it duplicates>"}}
   ],
-  "overall": "<1-2 sentences for the summary comment>"
+  "overall": "<1-2 sentences for the summary comment>",
+  "intent_mismatch": "<one sentence ONLY if the code clearly diverges from the author's stated intent; otherwise an empty string>"
 }}
 ```
 

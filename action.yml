@@ -56,6 +56,15 @@ inputs:
     required: false
     default: ""
 
+  update-pr-description:
+    description: >
+      When "true" (default), analysis runs append/refresh a short marker-bounded
+      Zenik block at the BOTTOM of the PR description (counts + a pointer to the
+      comments). The author's own text is never modified; re-runs replace only
+      Zenik's block. Set to "false" to never touch the description.
+    required: false
+    default: "true"
+
   zenik-client-key:
     description: "The caller's Zenik client key (machine credential; Bearer auth to the platform)."
     required: false
@@ -189,5 +198,6 @@ runs:
         AGENT_TIMEOUT_SECONDS: ${{ inputs.agent-timeout-seconds }}
         ZENIK_API_URL: ${{ inputs.zenik-api-url }}
         ZENIK_CLIENT_KEY: ${{ inputs.zenik-client-key }}
+        ZENIK_UPDATE_PR_DESCRIPTION: ${{ inputs.update-pr-description }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
       run: python ${{ github.action_path }}/run_zenik.py

@@ -115,6 +115,52 @@ COMMENT_MARKER = "<!-- zenik-action:change-impact -->"
 # them, and post a fresh review.
 INLINE_MARKER = "<!-- zenik-inline -->"
 
+# The PR-description block. Industry lesson (CodeRabbit appends into the body,
+# Qodo /describe rewrites it wholesale — both get complaints): NEVER touch the
+# author's text. Zenik owns exactly the region between these two markers at the
+# BOTTOM of the description, replaces only that region on re-runs, and writes
+# nothing at all when the client opts out (`update-pr-description: "false"`).
+DESC_MARKER_START = "<!-- zenik:impact -->"
+DESC_MARKER_END = "<!-- /zenik:impact -->"
+
+_DESC_BLOCK_RE = re.compile(
+    re.escape(DESC_MARKER_START) + r".*?" + re.escape(DESC_MARKER_END),
+    re.DOTALL,
+)
+
+
+def strip_description_block(body) -> str:
+    """The author's own description text: everything outside Zenik's marker
+    region. Used both when refreshing the block and when feeding the body to
+    the agent as intent (our own counts must not read back as author intent)."""
+    return _DESC_BLOCK_RE.sub("", body or "").rstrip()
+
+
+def build_description_block(bundle: dict, structured=None) -> str:
+    """The 3-4 line block appended to the PR description. Counts only — the
+    detail lives in the inline comments and the summary comment."""
+    c = _counts(bundle)
+    if c["impacted"]:
+        cross = f", {c['cross_service']} cross-service ⚠" if c["cross_service"] else ""
+        tests = f" · {c['tests']} test(s) to run" if c["tests"] else ""
+        headline = (f"🛰 **Zenik:** {c['changed']} changed symbol(s) → "
+                    f"{c['impacted']} affected site(s){cross}{tests} · "
+                    "details in the Zenik comments below")
+    else:
+        headline = "🛰 **Zenik:** no impacted callers found for this change"
+    lines = [DESC_MARKER_START, "", "---", headline]
+    mismatch = ((structured or {}).get("intent_mismatch") or "").strip()
+    if mismatch:
+        lines.append(f"> ⚠️ **Description vs code:** {mismatch}")
+    lines += ["", DESC_MARKER_END]
+    return "\n".join(lines)
+
+
+def merge_description(existing_body, block: str) -> str:
+    """Author text verbatim + exactly one Zenik block at the bottom."""
+    author = strip_description_block(existing_body)
+    return (author + "\n\n" + block + "\n").lstrip("\n")
+
 _JSON_FENCE = re.compile(r"```json\s*\n(.*?)```", re.DOTALL)
 
 
@@ -241,6 +287,13 @@ def build_report(*, bundle: dict, agent_result, outcome: str,
         lines += [
             "> ⚠ The impact set was capped — there may be more affected sites "
             "than shown.",
+            "",
+        ]
+
+    mismatch = ((structured or {}).get("intent_mismatch") or "").strip()
+    if mismatch:
+        lines += [
+            f"> ⚠️ **The PR description and the code disagree:** {mismatch}",
             "",
         ]
 

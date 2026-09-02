@@ -137,6 +137,21 @@ The findings land on the PR in three pieces, all authored by the client's own
 
 3. A `zenik/change-impact` **commit status**.
 
+4. **A 3-4 line block at the bottom of the PR description** — the counts
+   headline plus, when the agent flags one, an intent-mismatch warning ("the
+   description says docs-only but the diff changes `charge()`"). The block sits
+   between hidden `zenik:impact` markers, so the author's own text is **never
+   modified** — re-runs replace only Zenik's block. This is deliberately not
+   how CodeRabbit (appends into the body) or Qodo `/describe` (rewrites it)
+   behave; overwriting an author's description is the most-complained-about
+   habit of PR bots. Turn it off entirely with `update-pr-description: "false"`.
+   `/zenik fix` never touches the description.
+
+The agent also reads the PR title + description as the author's **stated
+intent** and compares it against what the diff actually does — a clear
+divergence shows up as a warning in both the summary comment and the
+description block.
+
 Re-running on the same PR replaces its own output instead of stacking: the
 summary comment is updated in place, and the previous run's inline comments are
 found (by a hidden marker), deleted, and re-posted fresh. If the inline review

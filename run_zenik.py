@@ -51,8 +51,9 @@ import telemetry  # noqa: E402
 from agent_backends import AgentResult, select_backend  # noqa: E402
 from prompt import build_findings_prompt  # noqa: E402
 from report import (COMMENT_MARKER, INLINE_MARKER, build_inline_body,  # noqa: E402
-                    build_report, callers_of, check_summary, note_for,
-                    parse_agent_message)
+                    build_description_block, build_report, callers_of,
+                    check_summary, merge_description, note_for,
+                    parse_agent_message, strip_description_block)
 
 from zenik_indexer import build_index, changed_symbols, compute_impact  # noqa: E402
 from zenik_indexer.embeddings import get_embedder  # noqa: E402
@@ -75,6 +76,8 @@ class PRContext:
     head: Optional[str]
     pr_number: Optional[int]
     repo_path: Path
+    pr_title: str = ""
+    pr_body: str = ""
 
 
 def resolve_pr_context() -> PRContext:
@@ -89,6 +92,8 @@ def resolve_pr_context() -> PRContext:
     base = os.environ.get("ZENIK_BASE") or None
     head = os.environ.get("ZENIK_HEAD") or None
     pr_number = None
+    pr_title = ""
+    pr_body = ""
 
     pr_env = os.environ.get("ZENIK_PR_NUMBER")
     if pr_env and pr_env.isdigit():
@@ -109,10 +114,13 @@ def resolve_pr_context() -> PRContext:
             pr_number = int(pr["number"])
         if not full_name:
             full_name = (event.get("repository") or {}).get("full_name") or ""
+        pr_title = (pr.get("title") or "").strip()
+        pr_body = pr.get("body") or ""
 
     return PRContext(
         full_name=full_name, base=base, head=head,
         pr_number=pr_number, repo_path=CLIENT_REPO,
+        pr_title=pr_title, pr_body=pr_body,
     )
 
 
@@ -506,6 +514,34 @@ def post_commit_status(full_name: str, sha: str, description: str, token: str) -
     return res is not None
 
 
+def update_pr_description(ctx: PRContext, bundle: dict, structured,
+                          token: str) -> bool:
+    """Append/refresh Zenik's marker-bounded block at the BOTTOM of the PR
+    description. The author's own text is never modified — only the region
+    between the zenik:impact markers is replaced (CodeRabbit/Qodo-style body
+    rewrites are exactly what this avoids). `/zenik fix` never calls this.
+    Opt out with the `update-pr-description: "false"` action input."""
+    if os.environ.get("ZENIK_UPDATE_PR_DESCRIPTION", "true").lower() in (
+            "false", "0", "no"):
+        print("[zenik] PR-description block disabled by input")
+        return False
+    base = f"{_github_api()}/repos/{ctx.full_name}/pulls/{ctx.pr_number}"
+    current = _gh_request("GET", base, token)
+    if current is None:
+        print("[zenik] could not read the PR body; leaving the description alone")
+        return False
+    block = build_description_block(bundle, structured)
+    new_body = merge_description(current.get("body"), block)
+    if new_body == (current.get("body") or ""):
+        return True  # idempotent re-run, nothing to write
+    res = _gh_request("PATCH", base, token, {"body": new_body})
+    if res is None:
+        print("[zenik] PR-description update failed (non-fatal)")
+        return False
+    print("[zenik] refreshed the Zenik block in the PR description")
+    return True
+
+
 def publish_findings(ctx: PRContext, body: str, summary: str) -> bool:
     """Post the comment + status, or (local run / no token) print instead.
 
@@ -688,7 +724,11 @@ def main() -> None:
     agent_result = None
     outcome = telemetry.OUTCOME_NO_IMPACT
     if impacted or tests:
-        prompt = build_findings_prompt(diff_text, bundle)
+        # The author's stated intent: title + body, with any previous Zenik
+        # block stripped so our own counts never read back as "intent".
+        intent = "\n\n".join(p for p in (
+            ctx.pr_title, strip_description_block(ctx.pr_body)) if p).strip()
+        prompt = build_findings_prompt(diff_text, bundle, intent=intent)
         agent_result = run_agent(prompt)
         if agent_result is None:
             print("[zenik] No agent key configured (set OPENAI_API_KEY or "
@@ -740,6 +780,8 @@ def main() -> None:
     )
     summary = check_summary(bundle, outcome)
     publish_findings(ctx, body, summary)
+    if can_post:
+        update_pr_description(ctx, bundle, structured, token)
 
     # 7. Counts-only telemetry.
     duration = round(time.time() - started, 1)
