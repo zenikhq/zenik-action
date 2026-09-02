@@ -19,9 +19,11 @@ Then the run: check out the PR head branch, recompute the blast radius fresh
 (the findings comments may predate newer commits), hand the agent a fix prompt
 scoped to the implicated files, ENFORCE that scope in code by reverting any
 out-of-scope edits, commit crediting the requester, push, and reply with what
-changed. Pushes made with the default GITHUB_TOKEN do not re-trigger workflows
-(GitHub's loop prevention), so the findings run won't re-fire on the fix
-commit — the human reviews the diff; that is the contract.
+changed. The fix push (made with the default GITHUB_TOKEN) generates a
+pull_request synchronize event whose actor is github-actions[bot]; GitHub's
+loop protection CREATES the re-analysis run but parks it as "awaiting
+approval" instead of starting it — so re-checking the fixed code is one
+deliberate "Approve and run" click by a maintainer, never an automatic loop.
 """
 from __future__ import annotations
 
@@ -303,9 +305,9 @@ def run_fix() -> None:
     summary = (agent_result.final_message or "").strip()[:2500]
     reply(f"✅ Pushed fixes to `{head.get('ref')}` — **review the diff before "
           f"merging.**\n\n```\n{stat}\n```\n\n{summary}{dropped}\n\n"
-          f"_Note: this push does not re-trigger CI analysis "
-          f"(GitHub token loop prevention) — re-run the Zenik workflow to "
-          f"re-check the blast radius if needed._")
+          f"_Note: GitHub queues the re-analysis of this push but holds "
+          f"bot-triggered runs for approval — hit **Approve and run** on the "
+          f"Actions tab to re-check the blast radius on the fixed code._")
     _send_fix_telemetry(client_key, full_name, pr_number, "fixed",
                         agent_result, started, api_url)
     print(f"[zenik-fix] Done. files_changed={len(edited)}")
