@@ -49,10 +49,14 @@ def _diff_args(base: Optional[str], head: Optional[str]) -> list[str]:
     return ["HEAD"]
 
 
-def _name_status(repo: str, base: Optional[str], head: Optional[str]) -> dict[str, str]:
-    """path -> single-letter status (A/M/D/R/C...) using rename detection."""
+def _name_status(repo: str, base: Optional[str], head: Optional[str]
+                 ) -> dict[str, tuple[str, Optional[str]]]:
+    """path -> (single-letter status A/M/D/R/C..., old path for renames/copies).
+
+    Uses rename detection; for R/C rows the key is the NEW path and the second
+    element is the OLD path (None for plain A/M/D rows)."""
     code, out = _git(repo, ["diff", "--name-status", "--find-renames", *_diff_args(base, head)])
-    status: dict[str, str] = {}
+    status: dict[str, tuple[str, Optional[str]]] = {}
     if code != 0:
         return status
     for line in out.splitlines():
@@ -60,9 +64,10 @@ def _name_status(repo: str, base: Optional[str], head: Optional[str]) -> dict[st
         if len(parts) < 2:
             continue
         letter = parts[0][0]
-        # For renames/copies (R100/C75) the NEW path is the last field.
+        # For renames/copies (R100/C75) the row is "R100\told\tnew".
         path = parts[-1]
-        status[path] = letter
+        old_path = parts[1] if len(parts) >= 3 else None
+        status[path] = (letter, old_path)
     return status
 
 
@@ -163,14 +168,44 @@ def changed_symbols(
             name=sym.name, kind=sym.kind, path=sym.path, language=sym.language,
             start_line=sym.start_line, end_line=sym.end_line, change_type=change_type,
         )
+        _emit_changed(cs)
+
+    def _emit_changed(cs: ChangedSymbol):
         k = f"{cs.path}::{cs.name}::{cs.start_line}::{cs.change_type}"
         if k not in seen:
             seen.add(k)
             out.append(cs)
 
-    for path, letter in status.items():
+    def _warn_no_base(path: str):
+        print(f"[diff] WARNING: cannot read base version of {path} at {base_ref} — "
+              "its deletions/renames are invisible to blast radius (shallow clone? "
+              "fetch the base commit in CI)")
+
+    for path, (letter, old_path) in status.items():
         lang = languages.detect_language(path)
         if not lang:
+            continue
+
+        if letter in ("R", "C") and old_path:
+            # File rename (or copy) — the stored graph only knows the OLD path,
+            # so seeds must come from the base version at the old path. Every
+            # symbol in a renamed file "moves": importers of the old module
+            # path are all affected, so emit them all, module symbol included.
+            base_src = _content_at_ref(repo, base_ref, old_path)
+            if base_src is None:
+                _warn_no_base(old_path)
+            else:
+                for s in _symbols_of(old_path, base_src):
+                    _emit(s, CHANGE_MODIFIED)
+                fb = _module_fallback(old_path, base_src, CHANGE_MODIFIED)
+                if fb:
+                    _emit_changed(fb)
+            # Content edits on top of the rename: match the new side as usual.
+            rng = ranges.get(path, {"new": [], "old": []})
+            head_src = _content_head(repo, head, path)
+            for s in _symbols_of(path, head_src) if head_src is not None else []:
+                if _intersects(s, rng["new"]):
+                    _emit(s, CHANGE_MODIFIED)
             continue
 
         if letter == "A":
@@ -187,6 +222,8 @@ def changed_symbols(
 
         if letter == "D":
             src = _content_at_ref(repo, base_ref, path)
+            if src is None:
+                _warn_no_base(path)
             syms = _symbols_of(path, src) if src is not None else []
             for s in syms:
                 _emit(s, CHANGE_DELETED)
@@ -205,6 +242,8 @@ def changed_symbols(
                 matched = True
 
         base_src = _content_at_ref(repo, base_ref, path)
+        if base_src is None:
+            _warn_no_base(path)
         base_syms = _symbols_of(path, base_src) if base_src is not None else []
         for s in base_syms:
             if _intersects(s, rng["old"]):
