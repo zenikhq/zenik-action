@@ -18,12 +18,20 @@ the client's repo — so the shape of this file is gates first, work second:
 Then the run: check out the PR head branch, recompute the blast radius fresh
 (the findings comments may predate newer commits), hand the agent a fix prompt
 scoped to the implicated files, ENFORCE that scope in code by reverting any
-out-of-scope edits, commit crediting the requester, push, and reply with what
-changed. The fix push (made with the default GITHUB_TOKEN) generates a
-pull_request synchronize event whose actor is github-actions[bot]; GitHub's
-loop protection CREATES the re-analysis run but parks it as "awaiting
-approval" instead of starting it — so re-checking the fixed code is one
-deliberate "Approve and run" click by a maintainer, never an automatic loop.
+out-of-scope edits, commit AS zenik-ai[bot] crediting the requester, push, and
+reply with what changed.
+
+Identities, deliberately split: every reply on the PR is posted as
+`zenik-ai[bot]` via the Zenik GitHub App token (platform_auth), and the commit is
+authored/committed as `zenik-ai[bot]` too (resolved from GET /users/zenik-ai[bot] so
+GitHub links it to the app's avatar). The PUSH is the one thing that still
+uses the workflow's own GITHUB_TOKEN — the app has no contents access, on
+purpose, so the client's token is the only thing that can write to their
+branch. That push generates a pull_request synchronize event whose actor is
+github-actions[bot]; GitHub's loop protection CREATES the re-analysis run but
+parks it as "awaiting approval" instead of starting it — so re-checking the
+fixed code is one deliberate "Approve and run" click by a maintainer, never an
+automatic loop.
 """
 from __future__ import annotations
 
@@ -34,11 +42,13 @@ import sys
 import time
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).parent / "vendor"))
 sys.path.insert(0, str(Path(__file__).parent))
 
 import telemetry  # noqa: E402
+from platform_auth import InstallationToken  # noqa: E402
 
 _ALLOWED_ASSOC = {"OWNER", "MEMBER", "COLLABORATOR"}
 
@@ -114,15 +124,51 @@ def revert_paths(repo: Path, paths: list[str]) -> None:
                 pass
 
 
+def format_bot_identity(user: dict) -> tuple[str, str]:
+    """(git user.name, git user.email) for a GitHub bot user object.
+
+    `{id}+{login}@users.noreply.github.com` is the address GitHub uses to
+    link a commit to the bot's account (and avatar) — the same scheme as
+    github-actions[bot]'s well-known 41898282+... address."""
+    login = user.get("login") or "zenik-ai[bot]"
+    uid = user.get("id")
+    email = (f"{uid}+{login}@users.noreply.github.com" if uid is not None
+             else f"{login}@users.noreply.github.com")
+    return login, email
+
+
+def bot_identity_string(user: dict) -> str:
+    name, email = format_bot_identity(user)
+    return f"{name} <{email}>"
+
+
+def resolve_bot_identity(api: str, app_slug: str, token: str) -> tuple[str, str]:
+    """Look the app's bot user up ONCE (`GET /users/zenik-ai[bot]`, URL-encoded)
+    so the fix commit is authored as it. If the lookup fails, the commit still
+    carries the bot's login — it just won't link to the avatar."""
+    from run_zenik import _gh_request
+    login = f"{app_slug}[bot]"
+    user = _gh_request("GET", f"{api}/users/{quote(login, safe='')}", token)
+    if not isinstance(user, dict) or not user.get("login"):
+        print(f"[zenik-fix] could not resolve {login}'s user id; committing "
+              f"as {login} without an id-linked email")
+        user = {"login": login}
+    return format_bot_identity(user)
+
+
 def commit_and_push(repo: Path, head_ref: str, symbols: list[str],
-                    requester: str) -> bool:
-    _git(repo, "config", "user.name", "github-actions[bot]")
-    _git(repo, "config", "user.email",
-         "41898282+github-actions[bot]@users.noreply.github.com")
+                    requester: str, identity: tuple[str, str]) -> bool:
+    """Commit as the bot identity (zenik-ai[bot]) and push with the credentials
+    actions/checkout persisted — the workflow's GITHUB_TOKEN. The app token is
+    never used here: it has no contents access."""
+    name, email = identity
+    _git(repo, "config", "user.name", name)
+    _git(repo, "config", "user.email", email)
     _git(repo, "add", "-A")
     scope = ", ".join(symbols) if symbols else "the reported findings"
     msg = (f"Zenik: apply fixes for {scope}\n\n"
-           f"Requested by @{requester} via /zenik fix. Review before merging.")
+           f"Requested by @{requester} via /zenik fix. Review before merging.\n\n"
+           f"Requested-by: @{requester}")
     commit = _git(repo, "commit", "-m", msg)
     if commit.returncode != 0:
         print(f"[zenik-fix] commit failed: {commit.stderr.strip()[:300]}")
@@ -152,9 +198,7 @@ def run_fix() -> None:
     comment = event.get("comment") or {}
     issue = event.get("issue") or {}
     full_name = (event.get("repository") or {}).get("full_name") or ""
-    token = os.environ.get("GITHUB_TOKEN", "").strip()
     api = _github_api()
-    client_key = os.environ.get("ZENIK_CLIENT_KEY", "")
     api_url = os.environ.get("ZENIK_API_URL", "")
 
     cmd = parse_command(comment.get("body") or "")
@@ -166,13 +210,17 @@ def run_fix() -> None:
         print("[zenik-fix] /zenik on a plain issue; only PRs are supported")
         return
 
+    # Everything this run says on the PR is said as zenik-ai[bot]. Fetched once,
+    # here; an uninstalled app raises and main() fails the run loudly.
+    app = InstallationToken.fetch(api_url)
+
     def reply(text: str) -> None:
-        if token and full_name:
+        if full_name:
             _gh_request("POST",
                         f"{api}/repos/{full_name}/issues/{pr_number}/comments",
-                        token, {"body": text})
+                        app.bearer(), {"body": text})
         else:
-            print(f"[zenik-fix] (no token) reply would be:\n{text}")
+            print(f"[zenik-fix] (no repo) reply would be:\n{text}")
 
     if "error" in cmd:
         reply(cmd["error"])
@@ -187,7 +235,8 @@ def run_fix() -> None:
               f"Ask a maintainer to run it.")
         return
 
-    pr = _gh_request("GET", f"{api}/repos/{full_name}/pulls/{pr_number}", token)
+    pr = _gh_request("GET", f"{api}/repos/{full_name}/pulls/{pr_number}",
+                     app.bearer())
     if not pr:
         reply("Could not load this PR from the GitHub API; try again.")
         return
@@ -229,7 +278,7 @@ def run_fix() -> None:
     bundle = None
     if changed:
         qvecs = compute_query_vectors(index, changed)
-        bundle = post_impact(api_url, client_key, full_name, pr_number,
+        bundle = post_impact(api_url, full_name, pr_number,
                              changed, query_vectors=qvecs)
     if bundle is None:
         bundle = (compute_impact(index, changed, semantic=False).to_dict()
@@ -241,13 +290,13 @@ def run_fix() -> None:
     findings: list[str] = []
     listed = _gh_request(
         "GET", f"{api}/repos/{full_name}/issues/{pr_number}/comments?per_page=100",
-        token)
+        app.bearer())
     for c in (listed if isinstance(listed, list) else []):
         if COMMENT_MARKER in (c.get("body") or ""):
             findings.append(c["body"])
     inline = _gh_request(
         "GET", f"{api}/repos/{full_name}/pulls/{pr_number}/comments?per_page=100",
-        token)
+        app.bearer())
     for c in (inline if isinstance(inline, list) else []):
         if INLINE_MARKER in (c.get("body") or ""):
             findings.append(f"(inline on {c.get('path')}:{c.get('line')})\n"
@@ -260,8 +309,8 @@ def run_fix() -> None:
                "no agent key configured (OPENAI_API_KEY / ANTHROPIC_API_KEY)")
         reply(f"⚠️ The fix agent did not complete: {str(err)[:400]}\n\n"
               f"No changes were pushed.")
-        _send_fix_telemetry(client_key, full_name, pr_number, "fix_failed",
-                            agent_result, started, api_url)
+        _send_fix_telemetry(pr_number, "fix_failed", agent_result, started,
+                            api_url)
         sys.exit(1)
 
     # Scope enforcement in code, not just prompt: the agent may only touch the
@@ -286,16 +335,16 @@ def run_fix() -> None:
                  f"file(s) — {note})" if out_of_scope else
                  "Its summary:\n\n" +
                  (agent_result.final_message or "(none)")[:2000]))
-        _send_fix_telemetry(client_key, full_name, pr_number, "fixed",
-                            agent_result, started, api_url)
+        _send_fix_telemetry(pr_number, "fixed", agent_result, started, api_url)
         return
 
+    identity = resolve_bot_identity(api, app.app_slug, app.bearer())
     if not commit_and_push(CLIENT_REPO, head.get("ref") or "",
-                           [c.name for c in changed], requester):
+                           [c.name for c in changed], requester, identity):
         reply("⚠️ The fixes were written but the commit/push failed — "
               "see the workflow log. No changes reached the branch.")
-        _send_fix_telemetry(client_key, full_name, pr_number, "fix_failed",
-                            agent_result, started, api_url)
+        _send_fix_telemetry(pr_number, "fix_failed", agent_result, started,
+                            api_url)
         sys.exit(1)
 
     stat = _git(CLIENT_REPO, "show", "--stat", "--format=", "HEAD").stdout.strip()
@@ -308,23 +357,25 @@ def run_fix() -> None:
           f"_Note: GitHub queues the re-analysis of this push but holds "
           f"bot-triggered runs for approval — hit **Approve and run** on the "
           f"Actions tab to re-check the blast radius on the fixed code._")
-    _send_fix_telemetry(client_key, full_name, pr_number, "fixed",
-                        agent_result, started, api_url)
+    _send_fix_telemetry(pr_number, "fixed", agent_result, started, api_url)
     print(f"[zenik-fix] Done. files_changed={len(edited)}")
 
 
-def _send_fix_telemetry(client_key, full_name, pr_number, outcome,
-                        agent_result, started, api_url) -> None:
+def _send_fix_telemetry(pr_number, outcome, agent_result, started,
+                        api_url) -> None:
     payload = telemetry.build_payload(
-        client_key=client_key, repo_full_name=full_name,
         run_id=telemetry.env_run_id(), outcome=outcome, pr_number=pr_number,
         impacted_count=0, changed_count=0, cross_service_count=0,
         duration_seconds=round(time.time() - started, 1),
         agent_result=agent_result,
     )
     telemetry.print_payload(payload)
-    telemetry.send(payload, api_url=api_url, client_key=client_key)
+    telemetry.send(payload, api_url=api_url)
 
 
 if __name__ == "__main__":
-    run_fix()
+    from platform_auth import PlatformAuthError, die
+    try:
+        run_fix()
+    except PlatformAuthError as e:
+        die(e)

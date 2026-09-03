@@ -15,9 +15,14 @@ radius in prose — no edits — so this builds a comment with two layers:
      is risky and what it pruned are the most useful part.
 
 Audience: the client's own engineer reading the PR their teammate just opened,
-via a comment authored by their own `github-actions[bot]`. The trust footer is
-factual: the whole thing ran on their runner with their keys, and only counts
-left the building.
+via a comment posted as `zenik-ai[bot]` (the Zenik GitHub App). The trust footer
+is factual: the whole thing ran on their runner with their keys, and only
+counts left the building.
+
+Also here: the **check run** payload (`build_check_run`) — the "Zenik" check
+on the PR head, with one annotation per changed symbol that has callers. It
+never blocks a merge on findings: `neutral` when there are findings, `success`
+when there are none, `failure` only when Zenik itself broke.
 """
 from __future__ import annotations
 
@@ -31,6 +36,12 @@ _MAX_LISTED = 25
 # Callers listed inside one inline comment's <details>; the rest go to the
 # dashboard. Inline comments must stay short or they defeat their purpose.
 _MAX_INLINE_CALLERS = 10
+
+# The check run on the PR head. GitHub accepts at most 50 annotations per
+# check-run request; beyond that the rest is in the comments/dashboard.
+CHECK_RUN_NAME = "Zenik"
+_MAX_ANNOTATIONS = 50
+_MAX_ANNOTATION_CALLERS = 5
 
 
 def _counts(bundle: dict) -> dict:
@@ -367,7 +378,7 @@ def build_report(*, bundle: dict, agent_result, outcome: str,
 
 
 def check_summary(bundle: dict, outcome: str) -> str:
-    """A one-line summary for the commit Check / status."""
+    """A one-line summary — the check run's title."""
     c = _counts(bundle)
     if outcome == "agent_failed":
         return "Zenik: agent failed; blast radius still posted"
@@ -375,3 +386,74 @@ def check_summary(bundle: dict, outcome: str) -> str:
         return "Zenik: no impact found for this change"
     extra = f", {c['cross_service']} cross-service" if c["cross_service"] else ""
     return f"Zenik: {c['impacted']} affected site(s){extra}"
+
+
+def check_conclusion(bundle: dict, outcome: str) -> str:
+    """`success` with no findings, `neutral` with findings, `failure` only
+    when Zenik itself errored. Findings never block a merge."""
+    if outcome == "agent_failed":
+        return "failure"
+    return "neutral" if _counts(bundle)["impacted"] else "success"
+
+
+def build_check_annotations(bundle: dict) -> list[dict]:
+    """One annotation per changed symbol that has callers, on the symbol's
+    span in the PR head. Deleted symbols have no lines in the head file, so
+    they are skipped (their detail is in the comments). Capped at GitHub's
+    50-per-request limit."""
+    out: list[dict] = []
+    for ch in bundle.get("changed") or []:
+        if ch.get("change_type") == "deleted":
+            continue
+        path = ch.get("path")
+        start = int(ch.get("start_line") or 0)
+        end = int(ch.get("end_line") or 0)
+        if not path or start < 1:
+            continue
+        callers = callers_of(bundle, ch.get("name"))
+        if not callers:
+            continue
+        names = [(c.get("symbol") or {}).get("name") or "?" for c in callers]
+        listed = ", ".join(names[:_MAX_ANNOTATION_CALLERS])
+        if len(callers) > _MAX_ANNOTATION_CALLERS:
+            listed += f", … {len(callers) - _MAX_ANNOTATION_CALLERS} more"
+        cross = any(c.get("cross_service") for c in callers)
+        out.append({
+            "path": path,
+            "start_line": start,
+            "end_line": max(end, start),
+            "annotation_level": "warning" if cross else "notice",
+            "title": f"Zenik: {ch.get('name')}",
+            "message": (f"`{ch.get('name')}` affects {len(callers)} caller(s)"
+                        + (" (cross-service)" if cross else "")
+                        + f": {listed}"),
+        })
+        if len(out) >= _MAX_ANNOTATIONS:
+            break
+    return out
+
+
+def build_check_run(bundle: dict, outcome: str, head_sha: str) -> dict:
+    """The completed check-run body for POST/PATCH /check-runs."""
+    c = _counts(bundle)
+    summary = (f"**{c['changed']}** changed symbol(s) → **{c['impacted']}** "
+               f"potentially affected site(s)")
+    if c["cross_service"]:
+        summary += f", **{c['cross_service']}** cross-service ⚠"
+    summary += "."
+    if c["tests"]:
+        summary += f" {c['tests']} test(s) likely relevant."
+    if outcome == "agent_failed":
+        summary += " The findings agent did not complete — see the job log."
+    summary += "\n\nDetails are in the Zenik comments on this PR."
+    return {
+        "name": CHECK_RUN_NAME,
+        "head_sha": head_sha,
+        "status": "completed",
+        "conclusion": check_conclusion(bundle, outcome),
+        "output": {
+            "title": check_summary(bundle, outcome),
+            "summary": summary,
+            "annotations": build_check_annotations(bundle),
+        },
+    }

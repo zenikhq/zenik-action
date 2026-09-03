@@ -12,9 +12,19 @@
 #   3. compute the PR's changed symbols and POST them to /v1/impact,
 #   4. run the client's own coding agent to write PROSE findings (level 2 — no
 #      code changes), and
-#   5. post those findings back on the PR as a comment + commit status using the
-#      client's own GITHUB_TOKEN (authored as their github-actions[bot]).
+#   5. post those findings back on the PR — inline review, summary comment,
+#      description block, and a "Zenik" check run — as `zenik-ai[bot]`.
 # Nothing in this action sends source code anywhere.
+#
+# Auth — no Zenik secret:
+#   * The action authenticates to the platform with the job's GitHub OIDC
+#     token, so the workflow needs `permissions: id-token: write`.
+#   * GitHub writes go through the Zenik GitHub App (https://github.com/apps/
+#     zenik — pull requests + checks write, metadata read, NO code access),
+#     whose short-lived installation token the platform hands the action.
+#     The app must be installed on the repo or the run fails with the link.
+#   * The workflow's own GITHUB_TOKEN is used for exactly one thing: pushing
+#     the commit a maintainer asks for with `/zenik fix`.
 name: "Zenik — change impact"
 description: "Computes a PR's blast radius with Zenik's index and posts prose findings + per-caller guidance to the PR."
 
@@ -52,7 +62,11 @@ inputs:
     default: "900"
 
   zenik-api-url:
-    description: "Base URL of the Zenik platform (serves /v1/index, /v1/impact, /v1/telemetry)."
+    description: >
+      Base URL of the Zenik platform (serves /v1/index, /v1/impact,
+      /v1/telemetry, and /v1/github/token — the Zenik GitHub App token the
+      action posts with). Authenticated with the job's GitHub OIDC token; no
+      Zenik secret is needed.
     required: false
     default: ""
 
@@ -65,17 +79,13 @@ inputs:
     required: false
     default: "true"
 
-  zenik-client-key:
-    description: "The caller's Zenik client key (machine credential; Bearer auth to the platform)."
-    required: false
-    default: ""
-
   github-token:
     description: >
-      Token used to post the PR comment + commit status. Defaults to the
-      workflow's own GITHUB_TOKEN, so the comment is authored by the caller's
-      github-actions[bot] in their own repo. Needs `pull-requests: write` and
-      `statuses: write` in the caller's workflow permissions.
+      The workflow's own token, used ONLY by `/zenik fix` to push its commit
+      to the PR branch (the Zenik GitHub App deliberately has no code access).
+      Nothing is posted with it — comments, reviews, and the check run are all
+      written as zenik-ai[bot] via the app. Needs `contents: write` in the
+      caller's workflow permissions only if `/zenik fix` is enabled.
     required: false
     default: ${{ github.token }}
 
@@ -197,7 +207,9 @@ runs:
         AGENT_MODEL: ${{ inputs.agent-model }}
         AGENT_TIMEOUT_SECONDS: ${{ inputs.agent-timeout-seconds }}
         ZENIK_API_URL: ${{ inputs.zenik-api-url }}
-        ZENIK_CLIENT_KEY: ${{ inputs.zenik-client-key }}
         ZENIK_UPDATE_PR_DESCRIPTION: ${{ inputs.update-pr-description }}
+        # Fix pushes only — never used to post. ACTIONS_ID_TOKEN_REQUEST_URL /
+        # _TOKEN (the OIDC handshake) are injected by the runner itself when
+        # the caller's workflow grants `id-token: write`.
         GITHUB_TOKEN: ${{ inputs.github-token }}
       run: python ${{ github.action_path }}/run_zenik.py

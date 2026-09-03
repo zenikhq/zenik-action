@@ -5,10 +5,12 @@ pull request, Zenik computes the **blast radius** of the change — what else it
 might break — and posts prose findings + per-caller guidance back on the PR.
 
 It runs **inside the client's own GitHub Actions CI**, on the client's runner,
-with the client's keys. There is no GitHub App and no Zenik-hosted runner that
-touches their code. Source never leaves the client's environment; only a
-*derived* index (symbols, edges, embeddings — never source text) is POSTed to
-the Zenik platform.
+with the client's keys. There is no Zenik-hosted runner that touches their
+code. Source never leaves the client's environment; only a *derived* index
+(symbols, edges, embeddings — never source text) is POSTed to the Zenik
+platform. The [Zenik GitHub App](https://github.com/apps/zenik-ai) exists only so
+the findings post as `zenik-ai[bot]` — it has **no code access** (pull requests +
+checks write, metadata read), and the install screen says so.
 
 See `DEMO.md` for an example-driven walkthrough, and `../BUILD.md` §5/§6/§10.1
 for the v0 scope and the machine→platform trust path.
@@ -29,8 +31,11 @@ On `on: pull_request`, in the client's CI:
 4. **Runs the client's coding agent** (Codex or Claude Code, reused from the
    prior prototype) to turn that bundle into **prose findings + per-caller
    guidance** — level 2. It produces text only; **it does not edit code** in v0.
-5. **Posts the findings to the PR** as a comment + a `zenik/change-impact` commit
-   status, authored by the client's own `github-actions[bot]`.
+5. **Posts the findings to the PR** — inline review comments, a summary
+   comment, a block in the PR description, and a **"Zenik" check run** with
+   per-symbol annotations — all as `zenik-ai[bot]` via the Zenik GitHub App. The
+   check never blocks a merge on findings (`neutral` with findings, `success`
+   without; `failure` only if Zenik itself broke).
 6. **Reports counts-only telemetry** to `/v1/telemetry` (never names or source).
 
 If the Zenik platform is unreachable, the action falls back to computing the
@@ -41,17 +46,22 @@ blanks the PR.
 
 ## Usage
 
-Add `.github/workflows/zenik.yml` to your repo (full example in
-[`examples/zenik.yml`](examples/zenik.yml)):
+Two steps, no Zenik secret:
+
+1. **Install the Zenik GitHub App** on the repo:
+   <https://github.com/apps/zenik-ai>. The install screen shows exactly what it
+   can do — pull requests, checks, metadata; no code access.
+2. **Merge the workflow** below as `.github/workflows/zenik.yml` (full example
+   in [`examples/zenik.yml`](examples/zenik.yml)). The merge itself triggers
+   the first indexing run. Done.
 
 ```yaml
 name: Zenik change impact
 on:
   pull_request:
 permissions:
-  contents: read
-  pull-requests: write
-  statuses: write
+  id-token: write               # Zenik authenticates to its platform with GitHub's OIDC token
+  contents: read                # actions/checkout (write only if you enable `/zenik fix`)
 jobs:
   zenik:
     runs-on: ubuntu-latest
@@ -62,7 +72,6 @@ jobs:
       - uses: zenikhq/zenik-action@v1
         with:
           zenik-api-url: https://api.zenik.dev
-          zenik-client-key: ${{ secrets.ZENIK_CLIENT_KEY }}
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
 ```
@@ -71,7 +80,6 @@ jobs:
 
 | Secret | Purpose |
 |---|---|
-| `ZENIK_CLIENT_KEY` | Your Zenik client key (machine credential; Bearer auth to the platform). |
 | `OPENAI_API_KEY` | Chunk embeddings **and** the Codex agent backend. |
 | `ANTHROPIC_API_KEY` | The Claude Code agent backend. |
 
@@ -86,6 +94,31 @@ the deterministic callers are still reported.
 
 ---
 
+## How the action authenticates
+
+One code path, no fallback (`platform_auth.py`):
+
+- **To the platform: GitHub Actions OIDC.** With `permissions: id-token: write`
+  the runner can mint a short-lived JWT that says which repo this job runs in.
+  Every platform call (`/v1/index`, `/v1/impact`, `/v1/telemetry`,
+  `/v1/github/token`) sends a fresh one as its bearer; the platform resolves
+  the repo from the token's `repository_id` claim. Nothing to rotate, nothing
+  to leak.
+- **To GitHub: the Zenik GitHub App.** The platform holds the app's private
+  key and hands the action a one-hour installation token for this repo
+  (`POST /v1/github/token`). Every write — the summary comment, the inline
+  review, the description block, the check run, `/zenik fix` replies — goes
+  through it, so it all appears as **`zenik-ai[bot]`**. The app deliberately has
+  **no contents permission**.
+- **The workflow's own `GITHUB_TOKEN`** does one thing: `/zenik fix` pushes its
+  commit with it (the commit itself is authored as `zenik-ai[bot]`). The action
+  never posts with it.
+
+If the app isn't installed on the repo, the run fails with a `::error::` and
+the install link — it does not quietly post as `github-actions[bot]` instead.
+
+---
+
 ## Inputs
 
 | Input | Default | Description |
@@ -95,9 +128,9 @@ the deterministic callers are still reported.
 | `agent-backend` | `""` | `codex` or `claude-code`. Defaults to whichever key is set (codex if both). |
 | `agent-model` | `""` | Optional model override passed to the agent CLI. |
 | `agent-timeout-seconds` | `900` | Wall-clock limit for the agent run. |
-| `zenik-api-url` | `""` | Base URL of the Zenik platform. |
-| `zenik-client-key` | `""` | Your Zenik client key (Bearer auth). |
-| `github-token` | `${{ github.token }}` | Token used to post the PR comment + status. |
+| `zenik-api-url` | `""` | Base URL of the Zenik platform (OIDC-authenticated; no secret). |
+| `update-pr-description` | `"true"` | Append/refresh Zenik's marker-bounded block at the bottom of the PR description. |
+| `github-token` | `${{ github.token }}` | Used **only** by `/zenik fix` to push its commit. Never used to post. |
 
 ## Outputs
 
@@ -148,10 +181,13 @@ the action never talks to Postgres — it POSTs the derived index over HTTP.
 |---|---|
 | `action.yml` | The composite action: setup, grammar prefetch, Codex sandbox prep, the run step. |
 | `run_zenik.py` | Orchestrator — the PR blast-radius loop (forked from the prototype's `apply_fix.py`). |
+| `platform_auth.py` | OIDC token → platform calls; the Zenik GitHub App installation token; fail-loud errors. |
+| `fix.py` | The `/zenik fix` opt-in fix agent (gated; commits as `zenik-ai[bot]`, pushes with the workflow token). |
 | `agent_backends.py` | Codex / Claude Code adapters (reused verbatim from the prototype). |
 | `telemetry.py` | Counts-only, best-effort telemetry (reused; re-pointed at `/v1/telemetry`). |
 | `prompt.py` | Builds the **findings** prompt (PR diff + blast radius). |
-| `report.py` | Builds the PR-comment body (findings summary). |
+| `report.py` | Builds the PR-comment bodies and the check-run payload. |
+| `tests/` | Unit tests (`python -m pytest -q`). |
 | `sync_vendor.sh` + `vendor/` | Vendoring script + the committed indexer copy. |
 | `examples/zenik.yml` | A ready-to-copy client workflow. |
 

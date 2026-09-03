@@ -1,5 +1,10 @@
 # Example client workflow — drop this in your repo at .github/workflows/zenik.yml
 #
+# Requires the Zenik GitHub App installed on this repo
+# (https://github.com/apps/zenik-ai). Zenik authenticates to its platform with
+# GitHub's OIDC token — no Zenik secret needed. Everything Zenik posts (inline
+# review, summary comment, the "Zenik" check) appears as `zenik-ai[bot]`.
+#
 # Three modes from ONE workflow:
 #   pull_request      — Zenik computes the change's blast radius against the
 #                       stored graph and posts inline findings + a summary on
@@ -13,7 +18,6 @@
 #                       branch (opt-in per invocation; you review the diff).
 #
 # Required repository secrets (Settings → Secrets and variables → Actions):
-#   ZENIK_CLIENT_KEY   — your Zenik client key (machine credential for the platform)
 #   OPENAI_API_KEY     — used for chunk embeddings AND the Codex agent, OR
 #   ANTHROPIC_API_KEY  — used for the Claude Code agent
 # Provide at least one agent key. If you use Claude Code as the agent but still
@@ -29,13 +33,17 @@ on:
   issue_comment:
     types: [created]         # the `/zenik fix` command
 
+# id-token: write is REQUIRED — it is how Zenik proves this run's identity to
+# its platform (GitHub OIDC), instead of a shared secret.
 # contents: write exists ONLY for `/zenik fix` pushing its commit to the PR
-# branch; the analysis paths never write. The token still cannot modify
-# .github/workflows, and fix runs are permission-gated to maintainers inside.
+# branch (actions/checkout needs read); the analysis paths never write with
+# this token. Nothing else is needed: comments, reviews, and the check run are
+# posted by the Zenik GitHub App, not by this workflow's token. The token still
+# cannot modify .github/workflows, and fix runs are permission-gated to
+# maintainers inside.
 permissions:
+  id-token: write
   contents: write
-  pull-requests: write
-  statuses: write
 
 # Serialize runs per PR so a duplicate `/zenik fix` can't race the first one.
 concurrency:
@@ -63,7 +71,6 @@ jobs:
         uses: zenikhq/zenik-action@v1
         with:
           zenik-api-url: https://api.zenik.dev
-          zenik-client-key: ${{ secrets.ZENIK_CLIENT_KEY }}
 
           # One or both agent keys. If both are set, Codex is used by default;
           # pass agent-backend: claude-code to choose Claude Code instead.
@@ -72,6 +79,6 @@ jobs:
           # agent-backend: claude-code
           # agent-model: gpt-5-codex
 
-          # github-token defaults to the workflow's own token; only override to
-          # post as a different identity.
+          # github-token defaults to the workflow's own token. It is used only
+          # to push `/zenik fix` commits — Zenik never posts with it.
           # github-token: ${{ secrets.GITHUB_TOKEN }}

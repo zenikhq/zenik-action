@@ -19,6 +19,28 @@ it does the work where the client's code lives, so the code never leaves.
 
 ---
 
+## Onboarding: install the app, merge the workflow, done
+
+There is no Zenik secret to create or paste. Setting a repo up is:
+
+1. **Install the Zenik GitHub App** (<https://github.com/apps/zenik-ai>). The
+   install screen lists what it can touch — pull requests, checks, metadata —
+   and **no code access**. That is the whole point of the screen: a security
+   reviewer can see that Zenik cannot read the repo.
+2. **Merge `examples/zenik.yml`** as `.github/workflows/zenik.yml`. The merge
+   is a push to the default branch, which is the first indexing run.
+
+How the run proves who it is, with no secret: the workflow grants
+`id-token: write`, so GitHub will mint the job a short-lived **OIDC token**
+that names the repo it runs in. Every call to the platform carries a fresh one.
+The platform, in turn, holds the app's private key and hands the run a
+one-hour **installation token** for that repo (`POST /v1/github/token`) — and
+everything Zenik writes to GitHub goes through it, so it all appears as
+**`zenik-ai[bot]`**. If the app isn't installed, the run fails with the install
+link; it never falls back to posting as `github-actions[bot]`.
+
+---
+
 ## Two modes, one action
 
 The same action runs on two triggers, doing two different jobs:
@@ -109,8 +131,8 @@ several ways, **not to edit anything** — this is a report, not a fix.
 
 ### Step 5 — Post it on the PR
 
-The findings land on the PR in three pieces, all authored by the client's own
-`github-actions[bot]`:
+The findings land on the PR in four pieces, all posted as `zenik-ai[bot]` (the
+Zenik GitHub App):
 
 1. **Inline review comments on the changed code.** Each changed symbol gets one
    short comment pinned on its own diff hunk — headline caller counts, the
@@ -135,7 +157,12 @@ The findings land on the PR in three pieces, all authored by the client's own
    agent found that independently implements the same logic (not blast radius,
    not noise — a reminder), plus the trust footer.
 
-3. A `zenik/change-impact` **commit status**.
+3. A **"Zenik" check run** on the PR head, opened as *in progress* when the run
+   starts and completed at the end with one annotation per changed symbol
+   ("`exponent_for` affects 6 caller(s): …", pinned on the symbol's lines;
+   *warning* level when a caller is cross-service). It never blocks a merge on
+   findings: `neutral` when there are findings, `success` when there are none,
+   `failure` only if Zenik itself errored.
 
 4. **A 3-4 line block at the bottom of the PR description** — the counts
    headline plus, when the agent flags one, an intent-mismatch warning ("the
@@ -165,19 +192,24 @@ code. The entire body is counts and enums:
 
 ```json
 { "outcome": "reported", "changed_count": 1, "impacted_count": 26,
-  "cross_service_count": 17, "repo_hash": "sha256:fb2c75ae…",
+  "cross_service_count": 17, "run_id": "gh-run-…",
   "agent": {"backend": "claude-code", ...}, "usage": {"input_tokens": ...} }
 ```
 
-No file names, no paths, no symbol names, no source. The repo is a **salted
-hash**, not its name. The whole payload is printed in the job log so the client
-can see exactly what left their runner.
+No file names, no paths, no symbol names, no source — and **no repo identity
+in the body at all**: the request is authenticated with the job's OIDC token,
+and the platform derives its stable repo hash from that server-side. The whole
+payload is printed in the job log so the client can see exactly what left
+their runner.
 
 ---
 
 ## How the pieces fit
 
 ```
+every platform call: Authorization: Bearer <GitHub OIDC token>   (no secret)
+PR run start:      ──POST─▶ /v1/github/token ──▶ zenik-ai[bot] installation token
+                                                 (all GitHub writes below)
 PR opened
    │
    ▼
@@ -194,7 +226,8 @@ pull_request:
 build_findings_prompt(diff + bundle)  ──▶  coding agent (Codex/Claude)  ──▶ prose
    │
    ▼
-inline review comments + summary comment + commit status   /v1/telemetry (counts)
+inline review + summary comment + description block + "Zenik" check run
+                              (all as zenik-ai[bot])         /v1/telemetry (counts)
 ```
 
 If `/v1/impact` can't be reached (or the repo was never indexed — merge/run the
@@ -210,8 +243,10 @@ Forked from the prior prototype `../../zenik-proto/api-fix-action`:
 
 - **Reused near-verbatim:** `agent_backends.py` (the Codex + Claude Code adapters,
   pinned CLI versions, key-scoping, sandbox detection) and `telemetry.py` (the
-  counts-only, best-effort, salted-hash discipline — only the endpoint and the
-  field set changed for a PR run).
+  counts-only, best-effort discipline — the endpoint and the field set changed
+  for a PR run, and the repo hash moved server-side behind the OIDC identity).
+- **New:** `platform_auth.py` — the OIDC handshake, the app installation
+  token, and the fail-loud "app not installed" path.
 - **Rewritten:** `prompt.py` now builds a *findings* prompt instead of a *fix*
   prompt; `report.py` writes a blast-radius comment instead of a fix report; the
   orchestrator went from `apply_fix.py` (run agent → edit code → open PR) to
@@ -242,11 +277,21 @@ OPENAI_API_KEY=sk-...           # for embeddings + the Codex agent (optional) \
   python run_zenik.py
 ```
 
-With `ZENIK_DRY_RUN=1` and no `ZENIK_API_URL`, it parses the checkout, computes
-a deterministic-only blast radius locally, runs the agent if a key is set, and
-writes the comment to `zenik_change_impact.md` next to the checkout instead of
-posting to GitHub. Add `ZENIK_MODE=index` to exercise the graph-refresh mode
-instead (parse → manifest → embed-new-only → upload).
+With `ZENIK_DRY_RUN=1`, it parses the checkout, computes a deterministic-only
+blast radius locally, runs the agent if a key is set, and writes the comment to
+`zenik_change_impact.md` next to the checkout instead of posting to GitHub. A
+dry run needs no GitHub environment at all — no OIDC token, no app token — so
+a `ZENIK_API_URL` is ignored outside CI (the platform can only be called with
+an OIDC token). Add `ZENIK_MODE=index` to exercise the graph-refresh mode
+instead (parse → manifest → embed-new-only → upload). Without `ZENIK_DRY_RUN=1`
+a local run fails immediately with the `id-token: write` error, by design.
+
+Unit tests (the OIDC handshake, the fail-loud paths, the check-run payload,
+the bot identity, the comment builders) run anywhere:
+
+```bash
+python -m pytest -q
+```
 
 ---
 
@@ -255,6 +300,7 @@ instead (parse → manifest → embed-new-only → upload).
 - **No code fixes** — prose findings only (level 2). The agent never edits files.
 - **No test-running / verification** of a fix — that is the post-v0 differentiator.
 - **Full rebuild each run** — no incremental re-embedding yet.
-- **The live agent + live PR comment run only in real CI** (a Linux runner with a
-  real PR and a real `GITHUB_TOKEN`). Everything else — indexing, diff→symbols,
-  the platform round-trip, the findings prompt, the comment body — runs anywhere.
+- **The live agent + live PR posting run only in real CI** (a Linux runner with
+  a real PR, GitHub's OIDC token, and the Zenik app installed). Everything else —
+  indexing, diff→symbols, the platform round-trip, the findings prompt, the
+  comment body — runs anywhere.

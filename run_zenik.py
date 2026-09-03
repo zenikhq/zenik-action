@@ -18,10 +18,17 @@ change", this does the Zenik v0 loop:
   5. Build a FINDINGS prompt (PR diff + bundle) and run the client's coding agent
      (reused agent_backends), sandboxed. It returns PROSE — level-2 guidance, no
      code edits.
-  6. Post the findings to the PR as a comment + commit status via the client's
-     GITHUB_TOKEN (authored as their own github-actions[bot]).
+  6. Post the findings to the PR — inline review, summary comment, description
+     block, and a "Zenik" check run — as `zenik-ai[bot]`, via the Zenik GitHub
+     App's installation token (fetched from the platform; see platform_auth).
   7. Report counts-only telemetry to `/v1/telemetry`; gate outputs via
      GITHUB_OUTPUT.
+
+Auth (platform_auth.py): the action proves itself to the platform with the
+job's GitHub OIDC token — no Zenik secret — and posts to GitHub ONLY with the
+app token. There is no fallback to the workflow's GITHUB_TOKEN for posting: if
+the app isn't installed on the repo, the run fails loudly with the install
+link. The workflow token's one remaining job is `/zenik fix`'s push (fix.py).
 
 Every external call is best-effort where the prototype made it so (telemetry
 never fails the build; a platform blip degrades gracefully). A failed AGENT is a
@@ -47,13 +54,16 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).parent / "vendor"))
 sys.path.insert(0, str(Path(__file__).parent))
 
+import platform_auth  # noqa: E402
 import telemetry  # noqa: E402
 from agent_backends import AgentResult, select_backend  # noqa: E402
+from platform_auth import InstallationToken, PlatformAuthError  # noqa: E402
 from prompt import build_findings_prompt  # noqa: E402
-from report import (COMMENT_MARKER, INLINE_MARKER, build_inline_body,  # noqa: E402
+from report import (CHECK_RUN_NAME, COMMENT_MARKER, INLINE_MARKER,  # noqa: E402
+                    build_check_run, build_inline_body,
                     build_description_block, build_report, callers_of,
-                    check_summary, merge_description, note_for,
-                    parse_agent_message, strip_description_block)
+                    merge_description, note_for, parse_agent_message,
+                    strip_description_block)
 
 from zenik_indexer import build_index, changed_symbols, compute_impact  # noqa: E402
 from zenik_indexer.embeddings import get_embedder  # noqa: E402
@@ -78,6 +88,7 @@ class PRContext:
     repo_path: Path
     pr_title: str = ""
     pr_body: str = ""
+    from_fork: bool = False   # GitHub withholds the OIDC token on fork PRs
 
 
 def resolve_pr_context() -> PRContext:
@@ -94,6 +105,7 @@ def resolve_pr_context() -> PRContext:
     pr_number = None
     pr_title = ""
     pr_body = ""
+    from_fork = False
 
     pr_env = os.environ.get("ZENIK_PR_NUMBER")
     if pr_env and pr_env.isdigit():
@@ -116,11 +128,13 @@ def resolve_pr_context() -> PRContext:
             full_name = (event.get("repository") or {}).get("full_name") or ""
         pr_title = (pr.get("title") or "").strip()
         pr_body = pr.get("body") or ""
+        head_repo = ((pr.get("head") or {}).get("repo") or {}).get("full_name")
+        from_fork = bool(pr and head_repo and full_name and head_repo != full_name)
 
     return PRContext(
         full_name=full_name, base=base, head=head,
         pr_number=pr_number, repo_path=CLIENT_REPO,
-        pr_title=pr_title, pr_body=pr_body,
+        pr_title=pr_title, pr_body=pr_body, from_fork=from_fork,
     )
 
 
@@ -287,67 +301,34 @@ def changed_payload(changed) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Platform round-trip
+# Platform round-trip — every call carries a fresh OIDC bearer (platform_auth).
+# The platform resolves the repo from the token's `repository_id` claim;
+# `full_name` still travels in bodies its models expect it in (it validates
+# the two agree) but is never how we are identified.
 # ---------------------------------------------------------------------------
-def _platform_request(api_url: str, path: str, body: Optional[dict],
-                      client_key: str, method: str,
-                      timeout: int = _PLATFORM_TIMEOUT) -> Optional[dict]:
-    """Call the platform with the client bearer key. Returns the parsed
-    response, or None on any failure (logged, never raised)."""
-    if not api_url:
-        print(f"[zenik] no zenik-api-url configured; skipping {path}")
-        return None
-    url = api_url.rstrip("/") + path
-    data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(
-        url, data=data, method=method,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {client_key}",
-            "User-Agent": "zenik-action/1",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode()
-            return json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as e:
-        detail = ""
-        try:
-            detail = e.read().decode()[:400]
-        except Exception:
-            pass
-        print(f"[zenik] {path} -> HTTP {e.code}: {detail}")
-    except urllib.error.URLError as e:
-        print(f"[zenik] {path} -> could not reach platform ({e.reason})")
-    except Exception as e:  # noqa: BLE001
-        print(f"[zenik] {path} -> unexpected error ({type(e).__name__})")
-    return None
-
-
-def _platform_post(api_url: str, path: str, body: dict, client_key: str,
+def _platform_post(api_url: str, path: str, body: dict,
                    timeout: int = _PLATFORM_TIMEOUT) -> Optional[dict]:
-    return _platform_request(api_url, path, body, client_key, "POST", timeout)
+    return platform_auth.platform_request(api_url, path, body, "POST", timeout)
 
 
-def fetch_manifest(api_url, client_key, full_name) -> Optional[dict]:
+def fetch_manifest(api_url, full_name) -> Optional[dict]:
     """What the platform already holds for this repo (chunk content hashes)."""
     from urllib.parse import quote
-    return _platform_request(
+    return platform_auth.platform_request(
         api_url, f"/v1/index/manifest?full_name={quote(full_name, safe='')}",
-        None, client_key, "GET")
+        None, "GET")
 
 
-def post_index(api_url, client_key, full_name, commit_sha, result) -> Optional[dict]:
+def post_index(api_url, full_name, commit_sha, result) -> Optional[dict]:
     print(f"[zenik] POST /v1/index  ({result.stats()})")
     return _platform_post(api_url, "/v1/index", {
         "full_name": full_name,
         "commit_sha": commit_sha,
         "index": index_payload(result),
-    }, client_key, timeout=_INDEX_UPLOAD_TIMEOUT)
+    }, timeout=_INDEX_UPLOAD_TIMEOUT)
 
 
-def post_impact(api_url, client_key, full_name, pr_number, changed,
+def post_impact(api_url, full_name, pr_number, changed,
                 query_vectors=None) -> Optional[dict]:
     print(f"[zenik] POST /v1/impact  ({len(changed)} changed symbol(s), "
           f"{len(query_vectors or {})} fresh query vector(s))")
@@ -357,7 +338,7 @@ def post_impact(api_url, client_key, full_name, pr_number, changed,
         "changed": changed_payload(changed),
         "semantic": True,
         "query_vectors": query_vectors,
-    }, client_key)
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -396,7 +377,8 @@ def run_agent(prompt: str) -> Optional[AgentResult]:
 
 
 # ---------------------------------------------------------------------------
-# Posting to the PR via the client's GITHUB_TOKEN (author = github-actions[bot]).
+# Posting to the PR as zenik-ai[bot]. `token` is ALWAYS the Zenik GitHub App's
+# installation token (InstallationToken.bearer()) — never GITHUB_TOKEN.
 # ---------------------------------------------------------------------------
 def _github_api() -> str:
     return os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
@@ -499,19 +481,57 @@ def post_pr_review(full_name: str, pr_number: int, head_sha: str,
     return False
 
 
-def post_commit_status(full_name: str, sha: str, description: str, token: str) -> bool:
-    """Post a commit status (the 'check') on the PR head sha. A commit status
-    works with the plain GITHUB_TOKEN, unlike the Checks API which needs a
-    GitHub App identity."""
+def create_check_run(full_name: str, head_sha: str, token: str) -> Optional[int]:
+    """Open the "Zenik" check run as in_progress at the start of the run, so
+    the PR shows Zenik is working. Returns the check-run id (None on failure;
+    the completed result is then POSTed fresh at the end)."""
     api = _github_api()
     res = _gh_request(
-        "POST", f"{api}/repos/{full_name}/statuses/{sha}", token, {
-            "state": "success",
-            "context": "zenik/change-impact",
-            "description": description[:140],
+        "POST", f"{api}/repos/{full_name}/check-runs", token, {
+            "name": CHECK_RUN_NAME,
+            "head_sha": head_sha,
+            "status": "in_progress",
+            "output": {"title": "Zenik is computing the blast radius…",
+                       "summary": "Results will appear here and in the PR comments."},
         },
     )
-    return res is not None
+    check_id = res.get("id") if isinstance(res, dict) else None
+    if check_id:
+        print(f"[zenik] opened check run {check_id} (in_progress)")
+    return check_id
+
+
+def complete_check_run(full_name: str, check_id: Optional[int],
+                       payload: dict, token: str) -> bool:
+    """Finish the check run: PATCH the one opened at the start, or POST a
+    completed one if that failed. `payload` comes from report.build_check_run."""
+    api = _github_api()
+    if check_id:
+        res = _gh_request(
+            "PATCH", f"{api}/repos/{full_name}/check-runs/{check_id}", token,
+            {k: v for k, v in payload.items() if k != "head_sha"},
+        )
+    else:
+        res = _gh_request("POST", f"{api}/repos/{full_name}/check-runs",
+                          token, payload)
+    if res is None:
+        print("[zenik] check run update failed (non-fatal)")
+        return False
+    n = len((payload.get("output") or {}).get("annotations") or [])
+    print(f"[zenik] check run completed: {payload.get('conclusion')} "
+          f"({n} annotation(s))")
+    return True
+
+
+def fail_check_run(full_name: str, check_id: Optional[int], head_sha: str,
+                   message: str, token: str) -> None:
+    """Zenik itself broke: mark the check as failure so the PR says so."""
+    complete_check_run(full_name, check_id, {
+        "name": CHECK_RUN_NAME, "head_sha": head_sha,
+        "status": "completed", "conclusion": "failure",
+        "output": {"title": "Zenik did not complete",
+                   "summary": message[:1000]},
+    }, token)
 
 
 def update_pr_description(ctx: PRContext, bundle: dict, structured,
@@ -542,16 +562,16 @@ def update_pr_description(ctx: PRContext, bundle: dict, structured,
     return True
 
 
-def publish_findings(ctx: PRContext, body: str, summary: str) -> bool:
-    """Post the comment + status, or (local run / no token) print instead.
+def publish_findings(ctx: PRContext, body: str, token: Optional[str]) -> bool:
+    """Post the summary comment as zenik-ai[bot], or (dry run / no PR context —
+    `token` is None) print it instead.
 
     Returns True if something was actually posted to GitHub."""
-    token = os.environ.get("GITHUB_TOKEN", "").strip()
     dry = os.environ.get("ZENIK_DRY_RUN") == "1"
 
-    if dry or not token or not ctx.full_name or ctx.pr_number is None:
+    if not token or not ctx.full_name or ctx.pr_number is None:
         reason = ("ZENIK_DRY_RUN=1" if dry else
-                  "no GITHUB_TOKEN / PR context" if not token or ctx.pr_number is None
+                  "no PR context" if ctx.pr_number is None
                   else "no repo")
         print(f"[zenik] not posting to GitHub ({reason}). "
               f"The comment body follows:\n")
@@ -564,18 +584,13 @@ def publish_findings(ctx: PRContext, body: str, summary: str) -> bool:
             pass
         return False
 
-    ok_comment = post_pr_comment(ctx.full_name, ctx.pr_number, body, token)
-    ok_status = False
-    if ctx.head:
-        ok_status = post_commit_status(ctx.full_name, ctx.head, summary, token)
-    return ok_comment or ok_status
+    return post_pr_comment(ctx.full_name, ctx.pr_number, body, token)
 
 
 # ---------------------------------------------------------------------------
 # Index-update mode (push to the default branch): keep the stored graph fresh.
 # ---------------------------------------------------------------------------
-def run_index_update(ctx: PRContext, api_url: str, client_key: str,
-                     started: float) -> None:
+def run_index_update(ctx: PRContext, api_url: str, started: float) -> None:
     """The graph lives on the platform and mirrors the DEFAULT branch. This
     runs on `push` (and workflow_dispatch): parse everything (cheap), ask the
     platform which chunk hashes it already has, embed ONLY the new ones, and
@@ -588,7 +603,7 @@ def run_index_update(ctx: PRContext, api_url: str, client_key: str,
     index = build_index(str(ctx.repo_path), embed=False,
                         commit_sha=commit_sha, progress=True)
 
-    manifest = fetch_manifest(api_url, client_key, ctx.full_name) or {}
+    manifest = fetch_manifest(api_url, ctx.full_name) or {}
     known = set(manifest.get("content_hashes") or [])
     new_chunks = [c for c in index.chunks
                   if c.content_hash not in known and (c.text or "").strip()]
@@ -609,19 +624,18 @@ def run_index_update(ctx: PRContext, api_url: str, client_key: str,
             for c, v in zip(new_chunks, vectors):
                 c.embedding = v
 
-    resp = post_index(api_url, client_key, ctx.full_name, commit_sha, index)
+    resp = post_index(api_url, ctx.full_name, commit_sha, index)
     if resp is not None:
         print(f"[zenik] index updated: {resp.get('stats')}")
 
     payload = telemetry.build_payload(
-        client_key=client_key, repo_full_name=ctx.full_name,
         run_id=telemetry.env_run_id(), outcome=telemetry.OUTCOME_INDEXED,
         pr_number=None, impacted_count=0, changed_count=len(new_chunks),
         cross_service_count=0,
         duration_seconds=round(time.time() - started, 1), agent_result=None,
     )
     telemetry.print_payload(payload)
-    telemetry.send(payload, api_url=api_url, client_key=client_key)
+    telemetry.send(payload, api_url=api_url)
 
     gh_output = os.environ.get("GITHUB_OUTPUT")
     if gh_output:
@@ -665,25 +679,67 @@ def compute_query_vectors(index, changed) -> Optional[dict]:
 def main() -> None:
     started = time.time()
     ctx = resolve_pr_context()
-    client_key = os.environ.get("ZENIK_CLIENT_KEY", "")
     api_url = os.environ.get("ZENIK_API_URL", "")
+    dry = os.environ.get("ZENIK_DRY_RUN") == "1"
 
     # Three modes, one action: a push to the default branch refreshes the
     # stored graph (write path); a pull_request queries it (read path — no
     # upload); a `/zenik fix` PR comment runs the opt-in fix agent.
     event = (os.environ.get("ZENIK_MODE") or
              os.environ.get("GITHUB_EVENT_NAME") or "").strip()
-    if event in ("push", "workflow_dispatch", "index"):
-        run_index_update(ctx, api_url, client_key, started)
-        return
-    if event in ("issue_comment", "fix"):
-        from fix import run_fix
-        run_fix()
-        return
+    try:
+        if dry:
+            # A local dry run needs no GitHub at all: nothing is posted, and
+            # without an OIDC token the platform can't be called either, so
+            # the blast radius comes from the local parse.
+            if api_url and not platform_auth.oidc_available():
+                print("[zenik] dry run without a GitHub OIDC token; ignoring "
+                      "ZENIK_API_URL and computing the blast radius locally")
+                api_url = ""
+        elif not platform_auth.oidc_available():
+            if ctx.from_fork:
+                print("[zenik] this PR comes from a fork; GitHub does not issue "
+                      "an OIDC token to fork PRs, so Zenik cannot run on it")
+            raise PlatformAuthError(platform_auth.OIDC_MISSING_MESSAGE)
 
+        if event in ("push", "workflow_dispatch", "index"):
+            run_index_update(ctx, api_url, started)
+            return
+        if event in ("issue_comment", "fix"):
+            from fix import run_fix
+            run_fix()
+            return
+        run_analysis(ctx, api_url, dry, started)
+    except PlatformAuthError as e:
+        platform_auth.die(e)
+
+
+def run_analysis(ctx: PRContext, api_url: str, dry: bool, started: float) -> None:
+    """The pull_request path: query the graph, run the findings agent, post."""
     print(f"[zenik] repo={ctx.full_name or '(unknown)'} "
           f"base={ctx.base} head={ctx.head} pr=#{ctx.pr_number}")
 
+    # Decide up front whether this run posts anything, and if so get the app
+    # token NOW — an uninstalled app fails the run before any work is spent —
+    # and open the check run so the PR shows Zenik is working.
+    can_post = bool(not dry and ctx.full_name and ctx.pr_number is not None
+                    and ctx.head)
+    app: Optional[InstallationToken] = None
+    check_id: Optional[int] = None
+    if can_post:
+        app = InstallationToken.fetch(api_url)
+        check_id = create_check_run(ctx.full_name, ctx.head, app.bearer())
+    try:
+        _analyse_and_post(ctx, api_url, app, check_id, started)
+    except PlatformAuthError as e:
+        if app is not None and app.token:
+            fail_check_run(ctx.full_name, check_id, ctx.head, str(e), app.token)
+        raise
+
+
+def _analyse_and_post(ctx: PRContext, api_url: str,
+                      app: Optional[InstallationToken],
+                      check_id: Optional[int], started: float) -> None:
     commit_sha = ctx.head or git_head_sha(ctx.repo_path)
 
     # 1. Parse the checkout (no embedding, no upload — PRs only READ the
@@ -701,7 +757,7 @@ def main() -> None:
     bundle = None
     if changed:
         qvecs = compute_query_vectors(index, changed)
-        resp = post_impact(api_url, client_key, ctx.full_name, ctx.pr_number,
+        resp = post_impact(api_url, ctx.full_name, ctx.pr_number,
                            changed, query_vectors=qvecs)
         if resp is not None:
             bundle = resp
@@ -747,9 +803,10 @@ def main() -> None:
     else:
         print("[zenik] blast radius is empty; skipping the agent.")
 
-    # 6. Post the findings: inline review comments on the changed hunks first,
-    # then the (now shorter) summary comment + commit status. Any failure on
-    # the review path folds the detail back into the summary — never lose it.
+    # 6. Post the findings as zenik-ai[bot]: inline review comments on the changed
+    # hunks first, then the (now shorter) summary comment, the description
+    # block, and the check run. Any failure on the review path folds the
+    # detail back into the summary — never lose it.
     prose, structured = None, None
     if agent_result is not None and agent_result.ok:
         prose, structured = parse_agent_message(agent_result.final_message or "")
@@ -759,17 +816,16 @@ def main() -> None:
 
     inline = build_inline_candidates(bundle, structured, diff_text) if impacted else []
 
-    token = os.environ.get("GITHUB_TOKEN", "").strip()
-    dry = os.environ.get("ZENIK_DRY_RUN") == "1"
-    can_post = (bool(token) and not dry and ctx.full_name
-                and ctx.pr_number is not None and ctx.head)
+    # The agent may have run for most of the token's hour; bearer() re-fetches
+    # if it is close to expiry before the posting phase starts.
+    token = app.bearer() if app is not None else None
     inline_posted = False
-    if inline and can_post:
+    if inline and token:
         inline_posted = post_pr_review(
             ctx.full_name, ctx.pr_number, ctx.head, inline, token)
     elif inline:
         print(f"[zenik] not posting {len(inline)} inline comment(s) "
-              "(dry run / no token); bodies follow:\n")
+              "(dry run / no PR context); bodies follow:\n")
         for c in inline:
             print(f"--- {c['path']}:{c['line']} ---\n{c['body']}")
 
@@ -778,16 +834,15 @@ def main() -> None:
         pr_number=ctx.pr_number, truncated=bool(bundle.get("truncated")),
         agent_prose=prose, structured=structured, inline_posted=inline_posted,
     )
-    summary = check_summary(bundle, outcome)
-    publish_findings(ctx, body, summary)
-    if can_post:
+    publish_findings(ctx, body, token)
+    if token:
         update_pr_description(ctx, bundle, structured, token)
+        complete_check_run(ctx.full_name, check_id,
+                           build_check_run(bundle, outcome, ctx.head), token)
 
     # 7. Counts-only telemetry.
     duration = round(time.time() - started, 1)
     payload = telemetry.build_payload(
-        client_key=client_key,
-        repo_full_name=ctx.full_name,
         run_id=telemetry.env_run_id(),
         outcome=outcome,
         pr_number=ctx.pr_number,
@@ -798,7 +853,7 @@ def main() -> None:
         agent_result=agent_result,
     )
     telemetry.print_payload(payload)
-    telemetry.send(payload, api_url=api_url, client_key=client_key)
+    telemetry.send(payload, api_url=api_url)
 
     # Gate the client's downstream steps.
     gh_output = os.environ.get("GITHUB_OUTPUT")
