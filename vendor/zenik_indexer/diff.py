@@ -132,6 +132,54 @@ def _intersects(sym: Symbol, rngs: list[tuple[int, int]]) -> bool:
     return any(not (sym.end_line < s or sym.start_line > e) for s, e in rngs)
 
 
+# Symbol kinds that are CONTAINERS of definitions: a hunk inside one of their
+# members is a change to the member, not to the container. Everything else
+# (function, method, variable, ...) is a callable/value in its own right, and a
+# change inside something it encloses changes it too.
+_CONTAINER_KINDS = frozenset({"class", "interface", "enum", "type", "module", "namespace"})
+
+
+def _innermost_hits(syms: list[Symbol], rngs: list[tuple[int, int]]) -> list[Symbol]:
+    """Symbols the changed ranges touch, attributed to the innermost definition
+    — but only past CONTAINER kinds.
+
+    Symbols nest (a method inside a class, an inner function inside a
+    function). A hunk inside `OrderRoutingService.release` is a change to
+    `release`; emitting the class too would seed the walk with every user of
+    the class and drown the real blast radius. An enclosing container is still
+    emitted when some changed line falls in its own body outside every nested
+    hit (a field edit, a class-level annotation), so nothing goes invisible.
+
+    An enclosing FUNCTION or METHOD is always emitted: a decorator's inner
+    `wrapper`, a closure, a nested helper are part of the outer function's
+    behaviour, and the outer name is usually the only one callers reference
+    (`wrapper` is defined in every decorator module and resolves to nothing).
+    """
+    hits = [s for s in syms if _intersects(s, rngs)]
+    out: list[Symbol] = []
+    for s in hits:
+        if s.kind not in _CONTAINER_KINDS:
+            out.append(s)
+            continue
+        inner = [
+            t for t in hits
+            if t is not s
+            and t.start_line >= s.start_line and t.end_line <= s.end_line
+            and (t.end_line - t.start_line) < (s.end_line - s.start_line)
+        ]
+        if not inner:
+            out.append(s)
+            continue
+        own_line_changed = any(
+            not any(t.start_line <= line <= t.end_line for t in inner)
+            for a, b in rngs
+            for line in range(max(a, s.start_line), min(b, s.end_line) + 1)
+        )
+        if own_line_changed:
+            out.append(s)
+    return out
+
+
 def _module_fallback(rel_path: str, source: bytes, change_type: str) -> Optional[ChangedSymbol]:
     """When a diff touches a file but no symbol span covers the changed lines
     (top-level code, config-ish edits), fall back to the file's module symbol so
@@ -203,9 +251,9 @@ def changed_symbols(
             # Content edits on top of the rename: match the new side as usual.
             rng = ranges.get(path, {"new": [], "old": []})
             head_src = _content_head(repo, head, path)
-            for s in _symbols_of(path, head_src) if head_src is not None else []:
-                if _intersects(s, rng["new"]):
-                    _emit(s, CHANGE_MODIFIED)
+            head_syms = _symbols_of(path, head_src) if head_src is not None else []
+            for s in _innermost_hits(head_syms, rng["new"]):
+                _emit(s, CHANGE_MODIFIED)
             continue
 
         if letter == "A":
@@ -236,19 +284,17 @@ def changed_symbols(
 
         head_src = _content_head(repo, head, path)
         head_syms = _symbols_of(path, head_src) if head_src is not None else []
-        for s in head_syms:
-            if _intersects(s, rng["new"]):
-                _emit(s, CHANGE_MODIFIED)
-                matched = True
+        for s in _innermost_hits(head_syms, rng["new"]):
+            _emit(s, CHANGE_MODIFIED)
+            matched = True
 
         base_src = _content_at_ref(repo, base_ref, path)
         if base_src is None:
             _warn_no_base(path)
         base_syms = _symbols_of(path, base_src) if base_src is not None else []
-        for s in base_syms:
-            if _intersects(s, rng["old"]):
-                _emit(s, CHANGE_MODIFIED)
-                matched = True
+        for s in _innermost_hits(base_syms, rng["old"]):
+            _emit(s, CHANGE_MODIFIED)
+            matched = True
 
         if not matched:
             src = head_src if head_src is not None else base_src

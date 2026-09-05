@@ -94,6 +94,15 @@ class ImpactEngine:
         seeds: dict[str, str] = {}
         for cs in changed:
             keys = self._keys_by_name_path.get((cs.path, cs.name))
+            if keys and len(keys) > 1:
+                # A name can legitimately be defined more than once in a file —
+                # Go's `type Estimate struct` next to `func (e *X) Estimate()`
+                # is the common case. Prefer the definition(s) the changed
+                # lines actually touch, so a method edit doesn't also seed the
+                # unrelated type and drag in every consumer of it.
+                overlapping = [k for k in keys if self._overlaps(self.by_key[k], cs)]
+                if overlapping:
+                    keys = overlapping
             if not keys:
                 # Fall back to any symbol in the same file overlapping the lines,
                 # else the file's module symbol — never lose a changed file.

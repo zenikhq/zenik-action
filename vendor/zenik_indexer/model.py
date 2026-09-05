@@ -64,6 +64,16 @@ class Symbol:
     commit_sha: Optional[str] = None
     # Assigned by the store when persisted; the in-memory index uses a local id.
     id: Optional[str] = None
+    # Bare name of the enclosing type for nested definitions (a method's class,
+    # an inner class's outer class); None at top level. Display-only: it is not
+    # part of key() or to_row(), and `name` stays the bare identifier so
+    # name-based resolution keeps working.
+    parent: Optional[str] = None
+    # Declared namespace of the file, set on the synthetic `module` symbol only
+    # (C# `namespace A.B.C;` / `namespace A.B.C {`, Java `package a.b.c;`).
+    # edges.py scopes files declaring the same namespace together, wherever
+    # they live. Display-only like `parent`: not part of key() or to_row().
+    namespace: Optional[str] = None
 
     def key(self) -> str:
         """Stable identity within a repo, independent of the store's uuid.

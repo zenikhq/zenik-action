@@ -10,6 +10,7 @@ Runs standalone against any checkout, with or without a network (see embeddings)
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -37,6 +38,21 @@ def _git_head_sha(repo_path: str) -> Optional[str]:
 
 def _rel_posix(abs_path: str, root: str) -> str:
     return os.path.relpath(abs_path, root).replace(os.sep, "/")
+
+
+_GO_MODULE_RX = re.compile(r"^\s*module\s+(?P<path>\S+)", re.MULTILINE)
+
+
+def read_go_module(repo_path: str) -> Optional[str]:
+    """Module path from `<root>/go.mod` (`module github.com/x/repo`), or None
+    when the repo has no root go.mod. Only the root file is consulted: a
+    multi-module monorepo without a root go.mod keeps suffix-only scoping."""
+    try:
+        text = (Path(repo_path) / "go.mod").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    m = _GO_MODULE_RX.search(text)
+    return m.group("path").strip('"') if m else None
 
 
 def build_index(
@@ -88,7 +104,8 @@ def build_index(
         print(f"[indexer] parsed {n_files} files -> "
               f"{len(all_symbols)} symbols, {len(all_chunks)} chunks; resolving edges...")
 
-    edges: list[Edge] = build_edges(all_symbols, file_imports, all_refs)
+    edges: list[Edge] = build_edges(all_symbols, file_imports, all_refs,
+                                    go_module=read_go_module(root))
 
     if embed and all_chunks:
         emb = embedder or get_embedder()
