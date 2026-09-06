@@ -62,10 +62,11 @@ from prompt import build_findings_prompt  # noqa: E402
 from report import (CHECK_RUN_NAME, COMMENT_MARKER, INLINE_MARKER,  # noqa: E402
                     build_check_run, build_inline_body,
                     build_description_block, build_report, callers_of,
-                    merge_description, note_for, parse_agent_message,
-                    strip_description_block)
+                    merge_description, needs_action_for, note_for,
+                    parse_agent_message, strip_description_block)
 
 from zenik_indexer import build_index, changed_symbols, compute_impact  # noqa: E402
+from zenik_indexer.edges import is_test_path  # noqa: E402
 from zenik_indexer.embeddings import get_embedder  # noqa: E402
 
 # The client's repo — in real CI this is the working directory GitHub Actions
@@ -246,11 +247,39 @@ def diff_counts(diff_text: str) -> tuple[int, int, int]:
     return files, added, removed
 
 
+def impact_seeds(changed: list) -> tuple[list, list[str]]:
+    """The changed symbols worth a blast-radius query, and the names dropped.
+
+    A symbol this PR ADDED has no callers on the default branch — anything
+    the index returns for it is an embedding look-alike, not a dependency
+    (halcyon PR #3: a brand-new test method "used in 16 places"). A symbol in
+    a TEST file is a leaf: nothing depends on a test. Neither can have a real
+    answer, so neither is asked. They stay in the diff the agent reads; they
+    just don't seed impact or count toward "you changed N functions".
+    """
+    seeds, skipped = [], []
+    for ch in changed:
+        if ch.change_type == "added":
+            skipped.append(f"{ch.name} (added)")
+        elif is_test_path(ch.path or ""):
+            skipped.append(f"{ch.name} (test)")
+        else:
+            seeds.append(ch)
+    return seeds, skipped
+
+
 def build_inline_candidates(bundle: dict, structured, diff_text: str) -> list[dict]:
-    """One inline comment per changed symbol that has callers AND an anchorable
-    diff line inside its span — an added line (side RIGHT) when the change adds
-    code, a deleted line (side LEFT) for deletion-only changes. Symbols that
-    miss either fold back into the summary comment."""
+    """One inline comment per changed symbol that has callers, that the agent
+    judged actionable, AND that has an anchorable diff line inside its span —
+    an added line (side RIGHT) when the change adds code, a deleted line (side
+    LEFT) for deletion-only changes. Symbols that miss any of these fold back
+    into the summary comment.
+
+    An inline comment means "look here", so a symbol whose `per_symbol` entry
+    says `needs_action: false` gets none. With no structured reply (no agent,
+    or it failed) every symbol with callers posts, as before — the AI's
+    absence must not make Zenik quieter.
+    """
     anchors = diff_anchor_lines(diff_text)
     out = []
     # One comment per anchor. Two changed symbols can share a name and a span
@@ -260,6 +289,8 @@ def build_inline_candidates(bundle: dict, structured, diff_text: str) -> list[di
     for ch in bundle.get("changed") or []:
         callers = callers_of(bundle, ch.get("name"))
         if not callers:
+            continue
+        if structured is not None and not needs_action_for(structured, ch.get("name")):
             continue
         file_anchors = anchors.get(ch.get("path")) or {"added": [], "deleted": []}
         start = ch.get("start_line") or 0
@@ -774,6 +805,13 @@ def _analyse_and_post(ctx: PRContext, api_url: str,
     # 2. Changed symbols from the PR diff.
     changed = changed_symbols(str(ctx.repo_path), base=ctx.base, head=ctx.head)
     print(f"[zenik] changed symbols: {len(changed)}")
+
+    # Only symbols that can have callers seed the query (see impact_seeds).
+    changed, skipped = impact_seeds(changed)
+    if skipped:
+        print(f"[zenik] {len(skipped)} changed symbol(s) skipped for impact — "
+              "added or in a test file, so nothing can depend on them yet: "
+              + ", ".join(skipped))
 
     # 3. Blast radius from the platform; local fallback if it is unreachable.
     bundle = None

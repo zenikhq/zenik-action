@@ -43,6 +43,19 @@ CHECK_RUN_NAME = "Zenik"
 _MAX_ANNOTATIONS = 50
 _MAX_ANNOTATION_CALLERS = 5
 
+# "Tests worth running" is a to-do list, not a census: cap it and rank the
+# provable ones first (halcyon PR #3 listed 25 on bastion, mostly look-alikes).
+_MAX_TESTS = 8
+
+# Names listed on the "N other changes checked — nothing to do" line.
+_MAX_SAFE_NAMES = 6
+
+# The indexer's `cross_service` means "a different top-level area". In a
+# modular monolith (one src tree) that is never true, and in a multi-package
+# repo it is true of every package — neither is a "service" boundary the
+# reviewer would recognise, so the words stay generic.
+_ELSEWHERE = "in other parts of the codebase"
+
 
 def _plural(n: int, one: str, many: str) -> str:
     return f"{n} {one if n == 1 else many}"
@@ -66,7 +79,10 @@ def _reason(code) -> str:
 def _counts(bundle: dict) -> dict:
     changed = bundle.get("changed") or []
     impacted = bundle.get("impacted") or []
-    tests = bundle.get("tests") or []
+    # Same list the comment prints — a "9 tests worth running" count next to
+    # a three-item list is a contradiction the reviewer notices.
+    listed, more = rank_tests(bundle.get("tests") or [])
+    tests = listed + [None] * more
     cross = [it for it in impacted if it.get("cross_service")]
     services = set()
     for it in impacted:
@@ -118,21 +134,47 @@ def _impact_list(bundle: dict) -> list[str]:
     for it in impacted[:_MAX_LISTED]:
         s = it.get("symbol") or {}
         loc = f"{s.get('path')}:{s.get('start_line')}"
-        flag = " &nbsp;⚠ **other service**" if it.get("cross_service") else ""
+        flag = f" &nbsp;⚠ **{_ELSEWHERE}**" if it.get("cross_service") else ""
         lines.append(f"- `{loc}` — `{s.get('name')}` ({_reason(it.get('reason'))}){flag}")
     if len(impacted) > _MAX_LISTED:
         lines.append(f"- … {len(impacted) - _MAX_LISTED} more (see the Zenik dashboard)")
     return lines
 
 
+def _test_rank(it: dict) -> tuple:
+    """`tested_by` (a provable test→code edge) first, then any other provable
+    edge, then semantic look-alikes; shallower depth wins within a group."""
+    reason = it.get("reason") or ""
+    group = 0 if reason == "tested_by" else 2 if reason == "semantic" else 1
+    try:
+        depth = int(it.get("depth") or 0)
+    except (TypeError, ValueError):
+        depth = 0
+    return (group, depth)
+
+
+def rank_tests(tests: list[dict]) -> tuple[list[dict], int]:
+    """The tests worth listing, best first, and how many were left out.
+    Semantic look-alikes are dropped outright once there are 3+ provable ones
+    — a reviewer with real tests to run doesn't need guesses on the list."""
+    ranked = sorted(tests, key=_test_rank)
+    provable = [t for t in ranked if (t.get("reason") or "") != "semantic"]
+    if len(provable) >= 3:
+        ranked = provable
+    return ranked[:_MAX_TESTS], len(ranked) - len(ranked[:_MAX_TESTS])
+
+
 def _tests_list(bundle: dict) -> list[str]:
     tests = bundle.get("tests") or []
     if not tests:
         return []
+    listed, more = rank_tests(tests)
     out = ["", "**Tests worth running:**", ""]
-    for it in tests[:_MAX_LISTED]:
+    for it in listed:
         s = it.get("symbol") or {}
         out.append(f"- `{s.get('path')}:{s.get('start_line')}` — `{s.get('name')}`")
+    if more:
+        out.append(f"- +{more} more (see the Zenik dashboard)")
     return out
 
 
@@ -171,7 +213,7 @@ def build_description_block(bundle: dict, structured=None) -> str:
     detail lives in the inline comments and the summary comment."""
     c = _counts(bundle)
     if c["impacted"]:
-        cross = (f" ({c['cross_service']} in other services ⚠)"
+        cross = (f" ({c['cross_service']} {_ELSEWHERE} ⚠)"
                  if c["cross_service"] else "")
         tests = (f" · {_plural(c['tests'], 'test', 'tests')} worth running"
                  if c["tests"] else "")
@@ -218,12 +260,35 @@ def parse_agent_message(text):
     return text.strip(), None
 
 
-def note_for(structured, name: str):
+def _entry_for(structured, name: str):
     for entry in (structured or {}).get("per_symbol") or []:
         if isinstance(entry, dict) and entry.get("name") == name:
-            note = (entry.get("note") or "").strip()
-            return note or None
+            return entry
     return None
+
+
+def note_for(structured, name: str):
+    entry = _entry_for(structured, name)
+    note = ((entry or {}).get("note") or "").strip()
+    return note or None
+
+
+def needs_action_for(structured, name: str) -> bool:
+    """The agent's per-symbol verdict. Only an explicit `needs_action: false`
+    counts as safe — a symbol the agent didn't mention, or an older reply
+    without the key, stays actionable (same rule as `actionable`)."""
+    entry = _entry_for(structured, name)
+    return entry is None or entry.get("needs_action", True) is not False
+
+
+def safe_symbols(bundle: dict, structured) -> list[str]:
+    """Changed symbols the agent explicitly judged safe, in diff order."""
+    out: list[str] = []
+    for ch in bundle.get("changed") or []:
+        name = ch.get("name")
+        if name and name not in out and not needs_action_for(structured, name):
+            out.append(name)
+    return out
 
 
 def callers_of(bundle: dict, name: str) -> list[dict]:
@@ -247,7 +312,7 @@ def build_inline_body(changed: dict, callers: list[dict], note) -> str:
     head = (f"**Zenik** — `{name}` is used in **{len(callers)}** "
             f"{'place' if len(callers) == 1 else 'places'}")
     if cross:
-        head += f", {cross} in {'another service' if cross == 1 else 'other services'} ⚠"
+        head += f", {cross} {_ELSEWHERE} ⚠"
     head += "."
 
     lines = [INLINE_MARKER, head]
@@ -299,23 +364,37 @@ def build_report(*, bundle: dict, agent_result, outcome: str,
     `agent_prose` is the agent's reply with the machine JSON block stripped.
     """
     c = _counts(bundle)
+    all_safe = bool(c["impacted"]) and not actionable(bundle, structured)
 
-    summary = (f"You changed **{_plural(c['changed'], 'function', 'functions')}**. "
-               f"**{_plural(c['impacted'], 'place depends', 'places depend')}** on it")
-    if c["services"] and c["services"] > 1:
-        summary += f" across **{c['services']}** parts of the codebase"
-    if c["cross_service"]:
-        summary += (f", **{c['cross_service']}** of them in "
-                    f"{'another service' if c['cross_service'] == 1 else 'other services'} ⚠")
-    summary += "."
+    summary = f"You changed **{_plural(c['changed'], 'function', 'functions')}**. "
+    if all_safe:
+        # Reviewed and clean: the count is context, not a warning.
+        summary += (f"**{_plural(c['impacted'], 'place depends', 'places depend')}** "
+                    "on this change; all checked, none need changes.")
+    else:
+        summary += (f"**{_plural(c['impacted'], 'place depends', 'places depend')}** "
+                    "on it")
+        if c["cross_service"]:
+            summary += f", **{c['cross_service']}** of them {_ELSEWHERE} ⚠"
+        elif c["services"] and c["services"] > 1:
+            summary += f" across **{c['services']}** parts of the codebase"
+        summary += "."
 
     lines = [
         COMMENT_MARKER,
         "## Zenik — what this change touches",
         "",
         summary,
-        "",
     ]
+    safe = safe_symbols(bundle, structured) if inline_posted and not all_safe else []
+    if safe:
+        # The inline comments say "look here"; this line says where NOT to.
+        names = ", ".join(f"`{n}`" for n in safe[:_MAX_SAFE_NAMES])
+        if len(safe) > _MAX_SAFE_NAMES:
+            names += f", +{len(safe) - _MAX_SAFE_NAMES} more"
+        lines.append(f"{_plural(len(safe), 'other change', 'other changes')} "
+                     f"checked — nothing to do: {names}.")
+    lines.append("")
 
     if truncated or bundle.get("truncated"):
         lines += [
@@ -434,7 +513,7 @@ def check_summary(bundle: dict, outcome: str, structured=None) -> str:
     if not actionable(bundle, structured):
         return (f"Zenik: {_plural(c['impacted'], 'place', 'places')} checked, "
                 "none need changes")
-    extra = (f", {c['cross_service']} in other services" if c["cross_service"] else "")
+    extra = (f", {c['cross_service']} {_ELSEWHERE}" if c["cross_service"] else "")
     return (f"Zenik: {_plural(c['impacted'], 'place depends', 'places depend')} "
             f"on this change{extra}")
 
@@ -478,7 +557,7 @@ def build_check_annotations(bundle: dict) -> list[dict]:
             "title": f"Zenik: {ch.get('name')}",
             "message": (f"`{ch.get('name')}` is used in "
                         f"{_plural(len(callers), 'place', 'places')}"
-                        + (", some in other services" if cross else "")
+                        + (f", some {_ELSEWHERE}" if cross else "")
                         + f": {listed}"),
         })
         if len(out) >= _MAX_ANNOTATIONS:
@@ -493,7 +572,7 @@ def build_check_run(bundle: dict, outcome: str, head_sha: str,
     summary = (f"You changed **{_plural(c['changed'], 'function', 'functions')}**. "
                f"**{_plural(c['impacted'], 'place depends', 'places depend')}** on it")
     if c["cross_service"]:
-        summary += f", **{c['cross_service']}** in other services ⚠"
+        summary += f", **{c['cross_service']}** {_ELSEWHERE} ⚠"
     summary += "."
     if c["tests"]:
         summary += f" {_plural(c['tests'], 'test', 'tests')} worth running."
