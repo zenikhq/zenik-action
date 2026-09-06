@@ -164,14 +164,14 @@ class SupabaseStore:
                 if result.symbols:
                     values = [
                         (repo_id, s.kind, s.name, s.path, s.start_line, s.end_line,
-                         s.language, s.commit_sha)
+                         s.language, s.commit_sha, s.namespace)
                         for s in result.symbols
                     ]
                     ids = self._insert_returning(
                         cur,
                         "insert into symbols "
-                        "(repo_id, kind, name, path, start_line, end_line, language, commit_sha) values ",
-                        "(%s,%s,%s,%s,%s,%s,%s,%s)",
+                        "(repo_id, kind, name, path, start_line, end_line, language, commit_sha, namespace) values ",
+                        "(%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                         values,
                     )
                     for s, sid in zip(result.symbols, ids):
@@ -248,7 +248,7 @@ class SupabaseStore:
         conn = self._conn
         with conn.cursor() as cur:
             cur.execute(
-                "select id, kind, name, path, start_line, end_line, language, commit_sha "
+                "select id, kind, name, path, start_line, end_line, language, commit_sha, namespace "
                 "from symbols where repo_id = %s",
                 (repo_id,),
             )
@@ -256,11 +256,11 @@ class SupabaseStore:
 
         id_to_key: dict[str, str] = {}
         symbols: list[Symbol] = []
-        for sid, kind, name, path, start_line, end_line, language, commit_sha in sym_rows:
+        for sid, kind, name, path, start_line, end_line, language, commit_sha, namespace in sym_rows:
             s = Symbol(
                 name=name, kind=kind or "", path=path, language=language or "",
                 start_line=start_line or 0, end_line=end_line or 0,
-                commit_sha=commit_sha, id=str(sid),
+                commit_sha=commit_sha, id=str(sid), namespace=namespace,
             )
             id_to_key[str(sid)] = s.key()
             symbols.append(s)

@@ -1,5 +1,5 @@
 # zenik-indexer source pinned into vendor/ by sync_vendor.sh
 # Regenerate with ./sync_vendor.sh after bumping the indexer.
 source_repo=/Users/ashishlal/Desktop/zenik-v2/zenik-action/../zenik-indexer
-commit=be1f2ab38cbe03c8789848821eee087e976a01cb
-synced_at=2026-09-06T16:26:28Z
+commit=6d4f65c733425d9597a36c704f54d8bca9246262
+synced_at=2026-09-06T16:45:43Z

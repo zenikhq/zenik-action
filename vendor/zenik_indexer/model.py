@@ -92,6 +92,7 @@ class Symbol:
             "end_line": self.end_line,
             "language": self.language,
             "commit_sha": self.commit_sha,
+            "namespace": self.namespace,
         }
 
 
