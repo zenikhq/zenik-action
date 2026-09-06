@@ -36,9 +36,9 @@ def test_annotation_levels_and_message():
     a = ann[0]
     assert a["path"] == "svc/a.py"
     assert (a["start_line"], a["end_line"]) == (10, 20)
-    assert "affects 2 caller(s)" in a["message"]
+    assert "is used in 2 places" in a["message"]
     assert "g" in a["message"] and "k" in a["message"]
-    assert ann[1]["message"].startswith("`h` affects 1 caller(s): m")
+    assert ann[1]["message"].startswith("`h` is used in 1 place: m")
 
 
 def test_annotations_skip_deleted_and_callerless_symbols():
@@ -69,6 +69,6 @@ def test_build_check_run_shape():
     assert payload["status"] == "completed"
     assert payload["conclusion"] == "neutral"
     out = payload["output"]
-    assert out["title"] == "Zenik: 1 affected site(s)"
-    assert "1 test(s) likely relevant" in out["summary"]
+    assert out["title"] == "Zenik: 1 place depends on this change"
+    assert "1 test worth running" in out["summary"]
     assert len(out["annotations"]) == 1
