@@ -64,6 +64,9 @@ def build_payload(
     cross_service_count,
     duration_seconds,
     agent_result=None,
+    files_changed_count=None,
+    lines_added=None,
+    lines_removed=None,
 ):
     """Construct the complete telemetry payload.
 
@@ -108,6 +111,9 @@ def build_payload(
         "changed_count": changed_count,
         "impacted_count": impacted_count,
         "cross_service_count": cross_service_count,
+        "files_changed_count": files_changed_count,
+        "lines_added": lines_added,
+        "lines_removed": lines_removed,
         "duration_seconds": duration_seconds,
     }
 

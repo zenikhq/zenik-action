@@ -232,6 +232,20 @@ def diff_anchor_lines(diff_text: str) -> dict[str, dict[str, list[int]]]:
     return anchors
 
 
+def diff_counts(diff_text: str) -> tuple[int, int, int]:
+    """(files, lines added, lines removed) from a unified diff. Counts only —
+    the same shape as everything else telemetry carries."""
+    files = added = removed = 0
+    for line in (diff_text or "").splitlines():
+        if line.startswith("diff --git "):
+            files += 1
+        elif line.startswith("+") and not line.startswith("+++"):
+            added += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            removed += 1
+    return files, added, removed
+
+
 def build_inline_candidates(bundle: dict, structured, diff_text: str) -> list[dict]:
     """One inline comment per changed symbol that has callers AND an anchorable
     diff line inside its span — an added line (side RIGHT) when the change adds
@@ -239,6 +253,10 @@ def build_inline_candidates(bundle: dict, structured, diff_text: str) -> list[di
     miss either fold back into the summary comment."""
     anchors = diff_anchor_lines(diff_text)
     out = []
+    # One comment per anchor. Two changed symbols can share a name and a span
+    # (an indexer that resolves two hunks to the same enclosing class does
+    # exactly that), and two identical comments on one line reads as a bug.
+    seen: set[tuple] = set()
     for ch in bundle.get("changed") or []:
         callers = callers_of(bundle, ch.get("name"))
         if not callers:
@@ -259,6 +277,10 @@ def build_inline_candidates(bundle: dict, structured, diff_text: str) -> list[di
             print(f"[zenik] no anchorable diff line for `{ch.get('name')}` "
                   f"({ch.get('path')}); its detail stays in the summary comment")
             continue
+        key = (ch.get("path"), anchor, side, ch.get("name"))
+        if key in seen:
+            continue
+        seen.add(key)
         out.append({
             "path": ch.get("path"),
             "line": anchor,
@@ -777,6 +799,7 @@ def _analyse_and_post(ctx: PRContext, api_url: str,
 
     # 5. Findings agent — prose only, no edits.
     diff_text = pr_diff_text(ctx.repo_path, ctx.base, ctx.head)
+    n_files, n_added, n_removed = diff_counts(diff_text)
     agent_result = None
     outcome = telemetry.OUTCOME_NO_IMPACT
     if impacted or tests:
@@ -850,6 +873,7 @@ def _analyse_and_post(ctx: PRContext, api_url: str,
         impacted_count=len(impacted),
         changed_count=len(changed),
         cross_service_count=cross,
+        files_changed_count=n_files, lines_added=n_added, lines_removed=n_removed,
         duration_seconds=duration,
         agent_result=agent_result,
     )

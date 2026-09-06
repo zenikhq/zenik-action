@@ -15,7 +15,7 @@ def test_payload_is_counts_only_without_identity_fields():
     assert set(p) == {
         "schema_version", "run_id", "pr_number", "agent", "usage", "outcome",
         "changed_count", "impacted_count", "cross_service_count",
-        "duration_seconds",
+        "duration_seconds", "files_changed_count", "lines_added", "lines_removed",
     }
     # The pre-OIDC identity fields must never come back (spelled so this
     # file does not itself trip the repo-wide "no client key left" grep).
