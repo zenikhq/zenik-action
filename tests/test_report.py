@@ -40,7 +40,7 @@ def test_parse_agent_message_splits_prose_and_json():
 def test_build_report_carries_marker_and_trust_footer():
     body = build_report(bundle=_bundle(), agent_result=None, outcome="reported")
     assert body.startswith(COMMENT_MARKER)
-    assert "cross-service" in body
+    assert "other service" in body
     assert "/zenik fix" in body
     assert "a map of your code, not the code" in body
 

@@ -44,6 +44,25 @@ _MAX_ANNOTATIONS = 50
 _MAX_ANNOTATION_CALLERS = 5
 
 
+def _plural(n: int, one: str, many: str) -> str:
+    return f"{n} {one if n == 1 else many}"
+
+
+# Edge reasons as a reviewer would say them. The codes are the index's
+# vocabulary; nobody opening a PR should have to learn it.
+_REASON_WORDS = {
+    "calls_maybe": "calls it",
+    "references": "uses it",
+    "imports": "imports it",
+    "tested_by": "tests it",
+    "semantic": "similar code",
+}
+
+
+def _reason(code) -> str:
+    return _REASON_WORDS.get(code or "", code or "depends on it")
+
+
 def _counts(bundle: dict) -> dict:
     changed = bundle.get("changed") or []
     impacted = bundle.get("impacted") or []
@@ -94,13 +113,13 @@ def _usage_line(agent_result):
 def _impact_list(bundle: dict) -> list[str]:
     impacted = bundle.get("impacted") or []
     if not impacted:
-        return ["_No affected sites were found for this change._"]
+        return ["_Nothing else in the repo depends on this change._"]
     lines = []
     for it in impacted[:_MAX_LISTED]:
         s = it.get("symbol") or {}
         loc = f"{s.get('path')}:{s.get('start_line')}"
-        flag = " &nbsp;⚠ **cross-service**" if it.get("cross_service") else ""
-        lines.append(f"- `{loc}` — `{s.get('name')}` ({it.get('reason')}){flag}")
+        flag = " &nbsp;⚠ **other service**" if it.get("cross_service") else ""
+        lines.append(f"- `{loc}` — `{s.get('name')}` ({_reason(it.get('reason'))}){flag}")
     if len(impacted) > _MAX_LISTED:
         lines.append(f"- … {len(impacted) - _MAX_LISTED} more (see the Zenik dashboard)")
     return lines
@@ -110,7 +129,7 @@ def _tests_list(bundle: dict) -> list[str]:
     tests = bundle.get("tests") or []
     if not tests:
         return []
-    out = ["", "**Tests likely relevant:**", ""]
+    out = ["", "**Tests worth running:**", ""]
     for it in tests[:_MAX_LISTED]:
         s = it.get("symbol") or {}
         out.append(f"- `{s.get('path')}:{s.get('start_line')}` — `{s.get('name')}`")
@@ -152,13 +171,16 @@ def build_description_block(bundle: dict, structured=None) -> str:
     detail lives in the inline comments and the summary comment."""
     c = _counts(bundle)
     if c["impacted"]:
-        cross = f", {c['cross_service']} cross-service ⚠" if c["cross_service"] else ""
-        tests = f" · {c['tests']} test(s) to run" if c["tests"] else ""
-        headline = (f"🛰 **Zenik:** {c['changed']} changed symbol(s) → "
-                    f"{c['impacted']} affected site(s){cross}{tests} · "
-                    "details in the Zenik comments below")
+        cross = (f" ({c['cross_service']} in other services ⚠)"
+                 if c["cross_service"] else "")
+        tests = (f" · {_plural(c['tests'], 'test', 'tests')} worth running"
+                 if c["tests"] else "")
+        headline = (f"🛰 **Zenik:** you changed "
+                    f"{_plural(c['changed'], 'function', 'functions')}; "
+                    f"{_plural(c['impacted'], 'place depends', 'places depend')} "
+                    f"on it{cross}{tests} · details in the comments below")
     else:
-        headline = "🛰 **Zenik:** no impacted callers found for this change"
+        headline = "🛰 **Zenik:** nothing else depends on this change"
     lines = [DESC_MARKER_START, "", "---", headline]
     mismatch = ((structured or {}).get("intent_mismatch") or "").strip()
     if mismatch:
@@ -222,21 +244,22 @@ def build_inline_body(changed: dict, callers: list[dict], note) -> str:
     """
     name = changed.get("name")
     cross = sum(1 for c in callers if c.get("cross_service"))
-    head = f"**Zenik** — `{name}`: **{len(callers)}** caller(s)"
+    head = (f"**Zenik** — `{name}` is used in **{len(callers)}** "
+            f"{'place' if len(callers) == 1 else 'places'}")
     if cross:
-        head += f", {cross} cross-service ⚠"
+        head += f", {cross} in {'another service' if cross == 1 else 'other services'} ⚠"
     head += "."
 
     lines = [INLINE_MARKER, head]
     if note:
         lines += ["", note]
     if callers:
-        lines += ["", "<details><summary>Callers</summary>", ""]
+        lines += ["", "<details><summary>Where</summary>", ""]
         for it in callers[:_MAX_INLINE_CALLERS]:
             s = it.get("symbol") or {}
             flag = " ⚠" if it.get("cross_service") else ""
             lines.append(f"- `{s.get('path')}:{s.get('start_line')}` — "
-                         f"`{s.get('name')}` ({it.get('reason')}){flag}")
+                         f"`{s.get('name')}` ({_reason(it.get('reason'))}){flag}")
         if len(callers) > _MAX_INLINE_CALLERS:
             lines.append(f"- … {len(callers) - _MAX_INLINE_CALLERS} more "
                          f"(see the Zenik dashboard)")
@@ -251,9 +274,10 @@ def _parallel_section(structured) -> list[str]:
              if isinstance(p, dict) and p.get("path")]
     if not items:
         return []
-    out = ["", "### Parallel implementations — keep in sync", "",
-           "_Not affected by this change, but they implement the same logic "
-           "independently. If the rule changed, change them too._", ""]
+    out = ["", "### Same logic lives elsewhere — keep in sync", "",
+           "_These don't call the changed code, but they do the same job on "
+           "their own. If the rule changed here, it probably needs to change "
+           "there too._", ""]
     for p in items[:_MAX_LISTED]:
         loc = p.get("path")
         if p.get("line"):
@@ -276,19 +300,18 @@ def build_report(*, bundle: dict, agent_result, outcome: str,
     """
     c = _counts(bundle)
 
-    summary = (
-        f"**{c['changed']}** changed symbol(s) → **{c['impacted']}** potentially "
-        f"affected site(s)"
-    )
-    if c["services"]:
-        summary += f" across **{c['services']}** service area(s)"
+    summary = (f"You changed **{_plural(c['changed'], 'function', 'functions')}**. "
+               f"**{_plural(c['impacted'], 'place depends', 'places depend')}** on it")
+    if c["services"] and c["services"] > 1:
+        summary += f" across **{c['services']}** parts of the codebase"
     if c["cross_service"]:
-        summary += f", **{c['cross_service']}** cross-service ⚠"
+        summary += (f", **{c['cross_service']}** of them in "
+                    f"{'another service' if c['cross_service'] == 1 else 'other services'} ⚠")
     summary += "."
 
     lines = [
         COMMENT_MARKER,
-        "## Zenik — change impact",
+        "## Zenik — what this change touches",
         "",
         summary,
         "",
@@ -296,8 +319,8 @@ def build_report(*, bundle: dict, agent_result, outcome: str,
 
     if truncated or bundle.get("truncated"):
         lines += [
-            "> ⚠ The impact set was capped — there may be more affected sites "
-            "than shown.",
+            "> ⚠ Only the first batch is listed — there are more places than "
+            "shown here.",
             "",
         ]
 
@@ -310,15 +333,14 @@ def build_report(*, bundle: dict, agent_result, outcome: str,
 
     if inline_posted:
         # Per-symbol detail is pinned inline on the diff; keep this an overview.
-        lines += ["_Per-symbol findings are pinned inline on the changed code._",
-                  ""]
+        lines += ["_Notes on each change are pinned on the diff._", ""]
         overall = ((structured or {}).get("overall") or "").strip()
         prose = overall or (agent_prose or "").strip()
         if prose:
-            lines += ["### Findings", "", prose]
+            lines += ["### What to know", "", prose]
         lines += _tests_list(bundle)
     else:
-        lines += ["### Blast radius", ""]
+        lines += ["### What depends on this change", ""]
         lines += _impact_list(bundle)
         lines += _tests_list(bundle)
 
@@ -327,14 +349,14 @@ def build_report(*, bundle: dict, agent_result, outcome: str,
                  else (agent_result.final_message or "")
                  if agent_result is not None else "").strip()
         if agent_result is not None and prose:
-            lines += ["", "### Findings & guidance", "", prose]
+            lines += ["", "### What to know", "", prose]
         elif agent_result is not None and agent_result.ok:
             lines += [
                 "",
-                "### Findings & guidance",
+                "### What to know",
                 "",
-                "_The agent completed but returned no summary text. The blast "
-                "radius above is the index's own answer._",
+                "_The AI didn't add notes this time. The list above still "
+                "stands — it comes from Zenik's index, not the AI._",
             ]
 
     lines += _parallel_section(structured)
@@ -343,12 +365,12 @@ def build_report(*, bundle: dict, agent_result, outcome: str,
         err = (agent_result.error if agent_result else "unknown error")[:1500]
         lines += [
             "",
-            "### ⚠️ The agent did not complete",
+            "### ⚠️ The AI notes didn't complete",
             "",
             f"```\n{err}\n```",
             "",
-            "The blast-radius list above still stands (it comes from Zenik's "
-            "index, not the agent), but the prose guidance is missing for this run.",
+            "The list above still stands — it comes from Zenik's index, not "
+            "the AI. Only the written guidance is missing this run.",
         ]
 
     # The opt-in fix affordance — only when there is something to fix. A PR
@@ -357,14 +379,14 @@ def build_report(*, bundle: dict, agent_result, outcome: str,
     if actionable(bundle, structured) and outcome != "agent_failed":
         lines += [
             "",
-            "> 💡 To have Zenik apply these fixes to this branch, comment "
-            "`/zenik fix` — or `/zenik fix <symbol>` to scope it. "
-            "Requires write access; you review the diff.",
+            "> 💡 Want Zenik to make these changes for you? Comment "
+            "`/zenik fix` (or `/zenik fix <name>` for just one). You get a "
+            "commit to review — nothing merges on its own.",
         ]
 
     # Footer: engine, cost, and the trust note.
     lines += ["", "---", ""]
-    lines.append(f"**Analysis by:** {_agent_line(agent_result)}")
+    lines.append(f"**Notes written by:** {_agent_line(agent_result)}")
     usage = _usage_line(agent_result)
     if usage:
         lines.append(f"**Token usage:** {usage} _(billed to this repo's own key)_")
@@ -406,13 +428,15 @@ def check_summary(bundle: dict, outcome: str, structured=None) -> str:
     """A one-line summary — the check run's title."""
     c = _counts(bundle)
     if outcome == "agent_failed":
-        return "Zenik: agent failed; blast radius still posted"
+        return "Zenik: AI notes failed; the dependency list is still posted"
     if c["impacted"] == 0:
-        return "Zenik: no impact found for this change"
+        return "Zenik: nothing depends on this change"
     if not actionable(bundle, structured):
-        return f"Zenik: {c['impacted']} site(s) reviewed, none need changes"
-    extra = f", {c['cross_service']} cross-service" if c["cross_service"] else ""
-    return f"Zenik: {c['impacted']} affected site(s){extra}"
+        return (f"Zenik: {_plural(c['impacted'], 'place', 'places')} checked, "
+                "none need changes")
+    extra = (f", {c['cross_service']} in other services" if c["cross_service"] else "")
+    return (f"Zenik: {_plural(c['impacted'], 'place depends', 'places depend')} "
+            f"on this change{extra}")
 
 
 def check_conclusion(bundle: dict, outcome: str, structured=None) -> str:
@@ -452,8 +476,9 @@ def build_check_annotations(bundle: dict) -> list[dict]:
             "end_line": max(end, start),
             "annotation_level": "warning" if cross else "notice",
             "title": f"Zenik: {ch.get('name')}",
-            "message": (f"`{ch.get('name')}` affects {len(callers)} caller(s)"
-                        + (" (cross-service)" if cross else "")
+            "message": (f"`{ch.get('name')}` is used in "
+                        f"{_plural(len(callers), 'place', 'places')}"
+                        + (", some in other services" if cross else "")
                         + f": {listed}"),
         })
         if len(out) >= _MAX_ANNOTATIONS:
@@ -465,15 +490,15 @@ def build_check_run(bundle: dict, outcome: str, head_sha: str,
                     structured=None) -> dict:
     """The completed check-run body for POST/PATCH /check-runs."""
     c = _counts(bundle)
-    summary = (f"**{c['changed']}** changed symbol(s) → **{c['impacted']}** "
-               f"potentially affected site(s)")
+    summary = (f"You changed **{_plural(c['changed'], 'function', 'functions')}**. "
+               f"**{_plural(c['impacted'], 'place depends', 'places depend')}** on it")
     if c["cross_service"]:
-        summary += f", **{c['cross_service']}** cross-service ⚠"
+        summary += f", **{c['cross_service']}** in other services ⚠"
     summary += "."
     if c["tests"]:
-        summary += f" {c['tests']} test(s) likely relevant."
+        summary += f" {_plural(c['tests'], 'test', 'tests')} worth running."
     if outcome == "agent_failed":
-        summary += " The findings agent did not complete — see the job log."
+        summary += " The AI notes didn't complete — see the job log."
     summary += "\n\nDetails are in the Zenik comments on this PR."
     return {
         "name": CHECK_RUN_NAME,
