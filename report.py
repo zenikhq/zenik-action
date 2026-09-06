@@ -351,8 +351,10 @@ def build_report(*, bundle: dict, agent_result, outcome: str,
             "index, not the agent), but the prose guidance is missing for this run.",
         ]
 
-    # The opt-in fix affordance — only when there is something to fix.
-    if c["impacted"] and outcome != "agent_failed":
+    # The opt-in fix affordance — only when there is something to fix. A PR
+    # the agent judged safe for every caller gets no offer: "apply these
+    # fixes" on a clean PR reads as an accusation.
+    if actionable(bundle, structured) and outcome != "agent_failed":
         lines += [
             "",
             "> 💡 To have Zenik apply these fixes to this branch, comment "
@@ -378,23 +380,48 @@ def build_report(*, bundle: dict, agent_result, outcome: str,
     return "\n".join(lines) + "\n"
 
 
-def check_summary(bundle: dict, outcome: str) -> str:
+def actionable(bundle: dict, structured) -> bool:
+    """Does anything on this PR actually need to change?
+
+    The index can only say "these sites depend on the changed code"; whether
+    the change is safe for them is the agent's call, returned per symbol as
+    `needs_action`. A PR whose every symbol came back `needs_action: false`
+    is a reviewed-and-safe PR — its check goes green and the fix offer is
+    withheld. With no structured reply (older agent, no agent) the impact
+    count stands in, which is the previous behaviour.
+
+    A `per_symbol` entry with no `needs_action` key counts as actionable, so a
+    partial or older reply can only make the check stricter, never greener.
+    """
+    if not _counts(bundle)["impacted"]:
+        return False
+    entries = [e for e in (structured or {}).get("per_symbol") or []
+               if isinstance(e, dict)]
+    if not entries:
+        return True
+    return any(e.get("needs_action", True) is not False for e in entries)
+
+
+def check_summary(bundle: dict, outcome: str, structured=None) -> str:
     """A one-line summary — the check run's title."""
     c = _counts(bundle)
     if outcome == "agent_failed":
         return "Zenik: agent failed; blast radius still posted"
     if c["impacted"] == 0:
         return "Zenik: no impact found for this change"
+    if not actionable(bundle, structured):
+        return f"Zenik: {c['impacted']} site(s) reviewed, none need changes"
     extra = f", {c['cross_service']} cross-service" if c["cross_service"] else ""
     return f"Zenik: {c['impacted']} affected site(s){extra}"
 
 
-def check_conclusion(bundle: dict, outcome: str) -> str:
-    """`success` with no findings, `neutral` with findings, `failure` only
-    when Zenik itself errored. Findings never block a merge."""
+def check_conclusion(bundle: dict, outcome: str, structured=None) -> str:
+    """`success` when nothing needs to change (no impact, or every impacted
+    site was judged safe), `neutral` when something does, `failure` only when
+    Zenik itself errored. Findings never block a merge."""
     if outcome == "agent_failed":
         return "failure"
-    return "neutral" if _counts(bundle)["impacted"] else "success"
+    return "neutral" if actionable(bundle, structured) else "success"
 
 
 def build_check_annotations(bundle: dict) -> list[dict]:
@@ -434,7 +461,8 @@ def build_check_annotations(bundle: dict) -> list[dict]:
     return out
 
 
-def build_check_run(bundle: dict, outcome: str, head_sha: str) -> dict:
+def build_check_run(bundle: dict, outcome: str, head_sha: str,
+                    structured=None) -> dict:
     """The completed check-run body for POST/PATCH /check-runs."""
     c = _counts(bundle)
     summary = (f"**{c['changed']}** changed symbol(s) → **{c['impacted']}** "
@@ -451,9 +479,9 @@ def build_check_run(bundle: dict, outcome: str, head_sha: str) -> dict:
         "name": CHECK_RUN_NAME,
         "head_sha": head_sha,
         "status": "completed",
-        "conclusion": check_conclusion(bundle, outcome),
+        "conclusion": check_conclusion(bundle, outcome, structured),
         "output": {
-            "title": check_summary(bundle, outcome),
+            "title": check_summary(bundle, outcome, structured),
             "summary": summary,
             "annotations": build_check_annotations(bundle),
         },

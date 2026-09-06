@@ -838,7 +838,8 @@ def _analyse_and_post(ctx: PRContext, api_url: str,
     if token:
         update_pr_description(ctx, bundle, structured, token)
         complete_check_run(ctx.full_name, check_id,
-                           build_check_run(bundle, outcome, ctx.head), token)
+                           build_check_run(bundle, outcome, ctx.head, structured),
+                         token)
 
     # 7. Counts-only telemetry.
     duration = round(time.time() - started, 1)

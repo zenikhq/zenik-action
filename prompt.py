@@ -199,7 +199,7 @@ End your reply with exactly one fenced ```json block (nothing after it):
 ```json
 {{
   "per_symbol": [
-    {{"name": "<changed symbol name>", "note": "<1-3 plain sentences: the real risk for this symbol's callers. Simple technical English. State the problem directly; no hedging, no jargon padding.>"}}
+    {{"name": "<changed symbol name>", "needs_action": <true if any caller must change or be re-checked; false if the change is safe for every caller>, "note": "<1-3 plain sentences: the real risk for this symbol's callers. Simple technical English. State the problem directly; no hedging, no jargon padding.>"}}
   ],
   "parallel": [
     {{"path": "<file>", "line": <line>, "why": "<one clause: what logic it duplicates>"}}
@@ -210,7 +210,9 @@ End your reply with exactly one fenced ```json block (nothing after it):
 ```
 
 One `per_symbol` entry per changed symbol (use the exact symbol names listed
-above). If a symbol's change is harmless, say so in its note in a few words.
+above). If a symbol's change is harmless, say so in its note in a few words AND
+set `needs_action` to false — that is what turns the PR's check green and hides
+the fix offer. Set it true whenever a caller genuinely has to change.
 `parallel` may be empty. The notes are posted verbatim as inline PR comments —
 write them for the developer, not for a log.
 
