@@ -527,7 +527,7 @@ def check_conclusion(bundle: dict, outcome: str, structured=None) -> str:
     return "neutral" if actionable(bundle, structured) else "success"
 
 
-def build_check_annotations(bundle: dict) -> list[dict]:
+def build_check_annotations(bundle: dict, structured=None) -> list[dict]:
     """One annotation per changed symbol that has callers, on the symbol's
     span in the PR head. Deleted symbols have no lines in the head file, so
     they are skipped (their detail is in the comments). Capped at GitHub's
@@ -543,6 +543,9 @@ def build_check_annotations(bundle: dict) -> list[dict]:
             continue
         callers = callers_of(bundle, ch.get("name"))
         if not callers:
+            continue
+        # Same gate as the inline comments: an annotation is a "look here".
+        if not needs_action_for(structured, ch.get("name")):
             continue
         names = [(c.get("symbol") or {}).get("name") or "?" for c in callers]
         listed = ", ".join(names[:_MAX_ANNOTATION_CALLERS])
@@ -587,6 +590,6 @@ def build_check_run(bundle: dict, outcome: str, head_sha: str,
         "output": {
             "title": check_summary(bundle, outcome, structured),
             "summary": summary,
-            "annotations": build_check_annotations(bundle),
+            "annotations": build_check_annotations(bundle, structured),
         },
     }

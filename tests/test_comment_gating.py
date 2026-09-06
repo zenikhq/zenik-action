@@ -154,3 +154,24 @@ def test_all_safe_summary_reads_as_checked_not_as_a_problem():
     assert "**2 places depend** on this change; all checked, none need changes." in body
     assert "places depend** on it" not in body
     assert "/zenik fix" not in body
+
+
+def test_annotations_skip_symbols_judged_safe():
+    from report import build_check_annotations
+    bundle = {
+        "changed": [
+            {"name": "hot", "path": "a.py", "start_line": 1, "end_line": 5, "change_type": "modified"},
+            {"name": "safe", "path": "a.py", "start_line": 10, "end_line": 15, "change_type": "modified"},
+        ],
+        "impacted": [
+            {"symbol": {"name": "x", "path": "b.py", "start_line": 1}, "reason": "calls_maybe",
+             "depth": 1, "confidence": 1.0, "cross_service": False, "via": ["hot"]},
+            {"symbol": {"name": "y", "path": "b.py", "start_line": 2}, "reason": "calls_maybe",
+             "depth": 1, "confidence": 1.0, "cross_service": False, "via": ["safe"]},
+        ],
+        "tests": [],
+    }
+    structured = {"per_symbol": [{"name": "hot", "needs_action": True, "note": "n"},
+                                 {"name": "safe", "needs_action": False, "note": "fine"}]}
+    assert [a["title"] for a in build_check_annotations(bundle, structured)] == ["Zenik: hot"]
+    assert len(build_check_annotations(bundle, None)) == 2
