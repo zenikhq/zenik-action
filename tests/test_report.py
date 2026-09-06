@@ -42,4 +42,4 @@ def test_build_report_carries_marker_and_trust_footer():
     assert body.startswith(COMMENT_MARKER)
     assert "cross-service" in body
     assert "/zenik fix" in body
-    assert "only a derived index" in body
+    assert "a map of your code, not the code" in body

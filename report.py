@@ -368,10 +368,11 @@ def build_report(*, bundle: dict, agent_result, outcome: str,
         lines.append(f"**Token usage:** {usage} _(billed to this repo's own key)_")
     lines += [
         "",
-        "_Ran entirely on this repository's own CI runner. Your source never left "
-        "your environment — only a derived index (symbols, edges, embeddings; no "
-        "source text) reached Zenik, and telemetry is counts-only (printed in full "
-        "in this job's log)._",
+        "_Ran on this repository's own CI runner with its own keys. Zenik stores a "
+        "map of your code, not the code: symbol names, file paths, the dependency "
+        "graph and semantic vectors — never source text. Embeddings are computed "
+        "here with your key; nothing but vectors reaches Zenik. Telemetry is "
+        "counts-only (printed in full in this job's log)._",
     ]
 
     return "\n".join(lines) + "\n"

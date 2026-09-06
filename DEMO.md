@@ -15,7 +15,7 @@ answer back on the PR — in the client's own repo, using the client's own keys.
 
 The other three repos are the brain (`zenik-indexer`), the memory
 (`zenik-platform`), and the screen (`zenik-dashboard`). This one is the **hands**:
-it does the work where the client's code lives, so the code never leaves.
+it does the work where the client's code lives, so source text never reaches Zenik.
 
 ---
 
@@ -82,7 +82,9 @@ A developer on the `meridian` repo edits `exponent_for` — the function that sa
 
 The parse is cheap (tree-sitter, a few seconds). It exists so the run can find
 the changed function's chunk text and so there is a local fallback if the
-platform is unreachable. **The source code itself never leaves the runner.**
+platform is unreachable. **Source text never reaches Zenik** — the only thing that
+leaves the runner with text in it is the embedding call, made to the client's own
+OpenAI account with the client's key; what comes back and is uploaded is vectors.
 
 ### Step 2 — Turn the diff into "changed symbols"
 

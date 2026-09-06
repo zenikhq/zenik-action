@@ -6,9 +6,11 @@ might break — and posts prose findings + per-caller guidance back on the PR.
 
 It runs **inside the client's own GitHub Actions CI**, on the client's runner,
 with the client's keys. There is no Zenik-hosted runner that touches their
-code. Source never leaves the client's environment; only a *derived* index
-(symbols, edges, embeddings — never source text) is POSTed to the Zenik
-platform. The [Zenik GitHub App](https://github.com/apps/zenik-ai) exists only so
+code. Zenik stores **a map of the code, not the code**: symbol names, file
+paths, the dependency graph and semantic vectors are POSTed to the platform —
+never source text. Embeddings are computed on the client's runner with the
+client's key, so chunk text goes to their embedding vendor under their own
+account and only vectors reach Zenik. The [Zenik GitHub App](https://github.com/apps/zenik-ai) exists only so
 the findings post as `zenik-ai[bot]` — it has **no code access** (pull requests +
 checks write, metadata read), and the install screen says so.
 
