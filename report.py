@@ -229,7 +229,8 @@ def build_description_block(bundle: dict, structured=None) -> str:
         headline = (f"🛰 **Zenik:** you changed "
                     f"{_plural(c['changed'], 'function', 'functions')}; "
                     f"{_plural(c['impacted'], 'place depends', 'places depend')} "
-                    f"on it{cross}{tests} · details in the comments below")
+                    f"on {'it' if c['changed'] == 1 else 'them'}{cross}{tests} · "
+                    "details in the comments below")
     else:
         headline = "🛰 **Zenik:** nothing else depends on this change"
     lines = [DESC_MARKER_START, "", "---", headline]
@@ -382,7 +383,7 @@ def build_report(*, bundle: dict, agent_result, outcome: str,
                     "on this change; all checked, none need changes.")
     else:
         summary += (f"**{_plural(c['impacted'], 'place depends', 'places depend')}** "
-                    "on it")
+                    f"on {'it' if c['changed'] == 1 else 'them'}")
         if c["cross_service"]:
             summary += f", **{c['cross_service']}** of them {_ELSEWHERE} ⚠"
         elif c["services"] and c["services"] > 1:

@@ -61,11 +61,38 @@ def _service_of(path: str) -> str:
     return parts[0] if parts else ""
 
 
+def _common_prefix(namespaces: list[str]) -> list[str]:
+    """Leading segments shared by every namespace: `com.halcyon` for a Java
+    repo, `Bastion` for a C# solution. Stripped before picking the area, so
+    the first *distinguishing* segment is the module."""
+    split = [ns.split(".") for ns in namespaces if ns]
+    if not split:
+        return []
+    prefix = split[0]
+    for segs in split[1:]:
+        n = 0
+        while n < len(prefix) and n < len(segs) and prefix[n] == segs[n]:
+            n += 1
+        prefix = prefix[:n]
+        if not prefix:
+            break
+    return prefix
+
+
 class ImpactEngine:
     """Precomputes lookup structures over one index, then answers impact queries."""
 
     def __init__(self, index: IndexResult):
         self.index = index
+        # File -> declared package/namespace (carried on the module symbol).
+        # A monolith keeps every module under one source root, so directories
+        # say nothing about boundaries there; the package does.
+        self._ns_by_path: dict[str, str] = {
+            s.path: s.namespace for s in index.symbols
+            if s.kind == KIND_MODULE and getattr(s, "namespace", None)
+        }
+        distinct = sorted(set(self._ns_by_path.values()))
+        self._ns_prefix = _common_prefix(distinct) if len(distinct) > 1 else []
         self.by_key: dict[str, Symbol] = {s.key(): s for s in index.symbols}
         # name/path lookups for matching changed symbols onto index symbols.
         self._keys_by_name_path: dict[tuple[str, str], list[str]] = defaultdict(list)
@@ -86,6 +113,17 @@ class ImpactEngine:
         for c in self._chunks:
             if c.symbol and c.symbol not in self._chunk_by_symbol:
                 self._chunk_by_symbol[c.symbol] = c
+
+    def _area_of(self, path: str) -> str:
+        """The module a file belongs to, for cross-area flagging. Namespace
+        first (first segment after the repo-wide prefix), directory otherwise."""
+        ns = self._ns_by_path.get(path)
+        if not ns:
+            return _service_of(path)
+        segs = ns.split(".")
+        n = len(self._ns_prefix)
+        rest = segs[n:] if segs[:n] == self._ns_prefix else segs
+        return "ns:" + (rest[0] if rest else segs[-1])
 
     # -- seed resolution ----------------------------------------------------
     def _resolve_seeds(self, changed: list[ChangedSymbol]) -> dict[str, str]:
@@ -201,7 +239,7 @@ class ImpactEngine:
         query_vectors: Optional[dict[str, list[float]]] = None,
     ) -> ContextBundle:
         seeds = self._resolve_seeds(changed)
-        changed_services = {_service_of(cs.path) for cs in changed}
+        changed_services = {self._area_of(cs.path) for cs in changed}
 
         det = self._walk(seeds, max_depth)
         sem = (self._semantic(seeds, top_semantic, query_vectors)
@@ -234,7 +272,7 @@ class ImpactEngine:
                 if key not in det:
                     confidence = round(sim, 3)
 
-            cross = _service_of(sym.path) not in changed_services
+            cross = self._area_of(sym.path) not in changed_services
             if cross:
                 score += _CROSS_SERVICE_BONUS
 
