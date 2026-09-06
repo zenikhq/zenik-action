@@ -85,7 +85,7 @@ def _counts(bundle: dict) -> dict:
 
 def _agent_line(agent_result) -> str:
     if agent_result is None:
-        return "_no agent configured — showing the index's blast radius only._"
+        return "_no AI configured — showing what Zenik's index found, without notes._"
     bits = [f"`{agent_result.backend}`"]
     if agent_result.model:
         bits.append(f"model `{agent_result.model}`")
