@@ -76,9 +76,18 @@ def _reason(code) -> str:
     return _REASON_WORDS.get(code or "", code or "depends on it")
 
 
+def provable(items) -> list[dict]:
+    """Impacted items reached through a real edge — an import, a call, a
+    reference, a test. Embedding look-alikes (`reason: semantic`) are not
+    callers of anything: they exist to feed the agent's parallel-implementation
+    judgement and surface only under "Same logic lives elsewhere" once it
+    confirms them. Every count and caller list a reviewer sees uses this."""
+    return [it for it in (items or []) if (it.get("reason") or "") != "semantic"]
+
+
 def _counts(bundle: dict) -> dict:
     changed = bundle.get("changed") or []
-    impacted = bundle.get("impacted") or []
+    impacted = provable(bundle.get("impacted"))
     # Same list the comment prints — a "9 tests worth running" count next to
     # a three-item list is a contradiction the reviewer notices.
     listed, more = rank_tests(bundle.get("tests") or [])
@@ -127,7 +136,7 @@ def _usage_line(agent_result):
 
 
 def _impact_list(bundle: dict) -> list[str]:
-    impacted = bundle.get("impacted") or []
+    impacted = provable(bundle.get("impacted"))
     if not impacted:
         return ["_Nothing else in the repo depends on this change._"]
     lines = []
@@ -294,7 +303,7 @@ def safe_symbols(bundle: dict, structured) -> list[str]:
 def callers_of(bundle: dict, name: str) -> list[dict]:
     """The impacted items that trace back to changed symbol `name` (via)."""
     out = []
-    for it in bundle.get("impacted") or []:
+    for it in provable(bundle.get("impacted")):
         if name in (it.get("via") or []):
             out.append(it)
     return out

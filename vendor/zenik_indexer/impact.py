@@ -245,8 +245,16 @@ class ImpactEngine:
             ))
 
         items.sort(key=lambda it: it.score, reverse=True)
-        truncated = len(items) > _MAX_IMPACT
-        items = items[:_MAX_IMPACT]
+        # Cap the two kinds separately. Semantic look-alikes are collected per
+        # seed (top_semantic each), so a PR with five seeds arrives with over a
+        # hundred of them and they were crowding provable depth-2/3 callers out
+        # of one shared cap. Provable edges get the full cap; look-alikes get
+        # one budget across all seeds. `truncated` speaks only for the provable
+        # list — a reviewer is never told "there may be more" about guesses.
+        provable = [it for it in items if it.reason != "semantic"]
+        lookalike = [it for it in items if it.reason == "semantic"]
+        truncated = len(provable) > _MAX_IMPACT
+        items = provable[:_MAX_IMPACT] + lookalike[:top_semantic]
 
         # Split tests out — a change's relevant tests are surfaced on their own
         # (the `tested_by` reason or a test-looking path), not buried in callers.

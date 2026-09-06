@@ -175,3 +175,28 @@ def test_annotations_skip_symbols_judged_safe():
                                  {"name": "safe", "needs_action": False, "note": "fine"}]}
     assert [a["title"] for a in build_check_annotations(bundle, structured)] == ["Zenik: hot"]
     assert len(build_check_annotations(bundle, None)) == 2
+
+
+def test_semantic_lookalikes_are_not_counted_as_callers():
+    from report import _counts, callers_of, _impact_list, build_report
+    bundle = {
+        "changed": [{"name": "availability", "path": "a.java", "start_line": 1,
+                     "end_line": 9, "change_type": "modified"}],
+        "impacted": [
+            {"symbol": {"name": "Ctl", "path": "a.java", "start_line": 30}, "reason": "references",
+             "depth": 1, "confidence": 1.0, "cross_service": False, "via": ["availability"]},
+            {"symbol": {"name": "postalPrefix", "path": "p/Address.java", "start_line": 39},
+             "reason": "semantic", "depth": 0, "confidence": 0.61, "cross_service": True,
+             "via": ["availability"]},
+            {"symbol": {"name": "keysEqual", "path": "p/Name.java", "start_line": 114},
+             "reason": "semantic", "depth": 0, "confidence": 0.58, "cross_service": True,
+             "via": ["availability"]},
+        ],
+        "tests": [],
+    }
+    c = _counts(bundle)
+    assert (c["impacted"], c["cross_service"]) == (1, 0)
+    assert [x["symbol"]["name"] for x in callers_of(bundle, "availability")] == ["Ctl"]
+    assert not any("similar code" in line for line in _impact_list(bundle))
+    body = build_report(bundle=bundle, agent_result=None, outcome="reported")
+    assert "1 place depends" in body and "postalPrefix" not in body
