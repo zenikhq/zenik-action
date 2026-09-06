@@ -70,6 +70,12 @@ inputs:
     required: false
     default: ""
 
+  zenik-dashboard-url:
+    description: >
+      Base URL of the Zenik dashboard. The PR's check run links to this
+      analysis there (/repos/{repo}/pr/{history}).
+    required: false
+    default: "https://zenik-dashboard.onrender.com"
   update-pr-description:
     description: >
       When "true" (default), analysis runs append/refresh a short marker-bounded
@@ -207,6 +213,7 @@ runs:
         AGENT_MODEL: ${{ inputs.agent-model }}
         AGENT_TIMEOUT_SECONDS: ${{ inputs.agent-timeout-seconds }}
         ZENIK_API_URL: ${{ inputs.zenik-api-url }}
+        ZENIK_DASHBOARD_URL: ${{ inputs.zenik-dashboard-url }}
         ZENIK_UPDATE_PR_DESCRIPTION: ${{ inputs.update-pr-description }}
         # Fix pushes only — never used to post. ACTIONS_ID_TOKEN_REQUEST_URL /
         # _TOKEN (the OIDC handshake) are injected by the runner itself when

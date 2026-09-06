@@ -72,3 +72,16 @@ def test_build_check_run_shape():
     assert out["title"] == "Zenik: 1 place depends on this change"
     assert "1 test worth running" in out["summary"]
     assert len(out["annotations"]) == 1
+
+
+def test_check_run_deep_links_to_the_dashboard(monkeypatch):
+    from report import build_check_run, dashboard_link
+    monkeypatch.setenv("ZENIK_DASHBOARD_URL", "https://dash.example/")
+    bundle = {"changed": [_changed("f")], "impacted": [_impacted("g", "f")], "tests": [],
+              "history_id": "hist_1", "repo_id": "repo_9"}
+    assert dashboard_link(bundle) == "https://dash.example/repos/repo_9/pr/hist_1"
+    assert build_check_run(bundle, "reported", "abc")["details_url"].endswith("/repos/repo_9/pr/hist_1")
+    # older platform: no ids -> the dashboard root, never a broken path
+    assert dashboard_link({"changed": [], "impacted": []}) == "https://dash.example"
+    monkeypatch.delenv("ZENIK_DASHBOARD_URL")
+    assert dashboard_link(bundle) is None

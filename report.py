@@ -27,6 +27,7 @@ when there are none, `failure` only when Zenik itself broke.
 from __future__ import annotations
 
 import json
+import os
 import re
 
 # Keep the inline blast-radius list readable in a PR comment; the full set is
@@ -475,6 +476,10 @@ def build_report(*, bundle: dict, agent_result, outcome: str,
 
     # Footer: engine, cost, and the trust note.
     lines += ["", "---", ""]
+    link = dashboard_link(bundle)
+    if link:
+        lines.append(f"**[View this analysis in Zenik →]({link})**")
+        lines.append("")
     lines.append(f"**Notes written by:** {_agent_line(agent_result)}")
     usage = _usage_line(agent_result)
     if usage:
@@ -578,6 +583,19 @@ def build_check_annotations(bundle: dict, structured=None) -> list[dict]:
     return out
 
 
+def dashboard_link(bundle: dict) -> str | None:
+    """Deep link to this analysis in the dashboard, when the platform returned
+    the ids (history_id/repo_id) and a dashboard URL is configured. Absent on
+    the local fallback and against an older platform."""
+    base = (os.environ.get("ZENIK_DASHBOARD_URL") or "").rstrip("/")
+    hid, rid = bundle.get("history_id"), bundle.get("repo_id")
+    if not base:
+        return None
+    if hid and rid:
+        return f"{base}/repos/{rid}/pr/{hid}"
+    return base
+
+
 def build_check_run(bundle: dict, outcome: str, head_sha: str,
                     structured=None) -> dict:
     """The completed check-run body for POST/PATCH /check-runs."""
@@ -592,10 +610,12 @@ def build_check_run(bundle: dict, outcome: str, head_sha: str,
     if outcome == "agent_failed":
         summary += " The AI notes didn't complete — see the job log."
     summary += "\n\nDetails are in the Zenik comments on this PR."
+    link = dashboard_link(bundle)
     return {
         "name": CHECK_RUN_NAME,
         "head_sha": head_sha,
         "status": "completed",
+        **({"details_url": link} if link else {}),
         "conclusion": check_conclusion(bundle, outcome, structured),
         "output": {
             "title": check_summary(bundle, outcome, structured),
